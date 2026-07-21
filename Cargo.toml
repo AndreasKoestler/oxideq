@@ -1,0 +1,16 @@
+[package]
+name = "oxideq"
+version = "0.1.0"
+edition = "2021"
+description = "Bit-perfect parametric EQ pipeline for PipeWire and CoreAudio"
+
+[dependencies]
+anyhow = "1.0.104"
+biquad = "0.6.0"
+cpal = "0.18.1"
+regex = "1.13.1"
+ringbuf = "0.5.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
