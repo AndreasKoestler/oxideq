@@ -12,7 +12,7 @@ section exactly, including its checkbox steps and design decisions.**
 - [x] Task 3: DSP — pluggable `Filter` trait + preamp + f64 biquad cascade (`src/dsp.rs`)
 - [x] Task 4: CPU & latency benchmarks + NFR guard test (`benches/dsp.rs`, `tests/perf.rs`)
 - [x] Task 5: Device discovery & sample-rate negotiation (`src/devices.rs`)
-- [ ] Task 6: Real-time engine — ring buffer + streams (`src/engine.rs`)
+- [x] Task 6: Real-time engine — ring buffer + streams (`src/engine.rs`)
 - [ ] Task 7: CLI + end-to-end wiring (`src/cli.rs`, `src/main.rs`)
 - [ ] Task 8: Tier 1 — PipeWire virtual sink installer (`src/routing.rs`)
 - [ ] Task 9: Tier 3 — pw-link auto-wiring + feedback guard
