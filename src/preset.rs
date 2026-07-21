@@ -1,7 +1,12 @@
 //! Equalizer APO / AutoEQ preset parsing.
 
 use anyhow::{bail, Result};
-use regex::Regex;
+use nom::branch::alt;
+use nom::bytes::complete::{tag_no_case, take_while1};
+use nom::character::complete::{char, digit1, one_of, space0, space1};
+use nom::combinator::{map_res, opt, recognize, value};
+use nom::sequence::{preceded, terminated};
+use nom::{IResult, Parser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
@@ -32,58 +37,180 @@ pub struct Parsed {
     pub warnings: Vec<String>,
 }
 
-pub fn parse(text: &str) -> Result<Parsed> {
-    let preamp_re = Regex::new(r"(?i)^\s*Preamp:\s*([-+]?\d+(?:\.\d+)?)\s*dB").unwrap();
-    // Loose match decides *whether* a line is a filter; strict match
-    // validates the arguments of supported types.
-    let loose_re = Regex::new(r"(?i)^\s*Filter\s*\d+:\s*(ON|OFF)\s+(\S+)").unwrap();
-    let strict_re = Regex::new(
-        r"(?i)^\s*Filter\s*\d+:\s*ON\s+\S+\s+Fc\s+(\d+(?:\.\d+)?)\s*Hz\s+Gain\s+([-+]?\d+(?:\.\d+)?)\s*dB\s+Q\s+(\d+(?:\.\d+)?)",
-    )
-    .unwrap();
+/// What a single line of the preset file turned out to be. Grammar only
+/// classifies; the skip/warn/error policy lives in `parse`.
+#[derive(Debug)]
+enum Line<'a> {
+    Preamp(f64),
+    /// `args` is `Some` only when the full `Fc .. Hz Gain .. dB Q ..`
+    /// argument list parsed.
+    Filter {
+        on: bool,
+        kind: &'a str,
+        args: Option<(f64, f64, f64)>,
+    },
+    Other,
+}
 
+/// Unsigned decimal: `105`, `0.70`.
+fn unum(i: &str) -> IResult<&str, f64> {
+    map_res(recognize((digit1, opt((char('.'), digit1)))), str::parse).parse(i)
+}
+
+/// Signed decimal: `-6.8`, `+1.5`, `2`.
+fn snum(i: &str) -> IResult<&str, f64> {
+    map_res(
+        recognize((opt(one_of("+-")), digit1, opt((char('.'), digit1)))),
+        str::parse,
+    )
+    .parse(i)
+}
+
+/// One whitespace-delimited word (the filter-type token).
+fn token(i: &str) -> IResult<&str, &str> {
+    take_while1(|c: char| !c.is_whitespace()).parse(i)
+}
+
+/// `Filter <n>:` — whitespace between `Filter` and the number is optional.
+fn filter_head(i: &str) -> IResult<&str, ()> {
+    value(
+        (),
+        (
+            space0,
+            tag_no_case("filter"),
+            space0,
+            digit1,
+            char(':'),
+            space0,
+        ),
+    )
+    .parse(i)
+}
+
+fn onoff(i: &str) -> IResult<&str, bool> {
+    alt((
+        value(true, tag_no_case("on")),
+        value(false, tag_no_case("off")),
+    ))
+    .parse(i)
+}
+
+/// `Fc <num> Hz` etc.; no space required before the unit (`100Hz`).
+fn fc_field(i: &str) -> IResult<&str, f64> {
+    preceded(
+        (tag_no_case("fc"), space1),
+        terminated(unum, (space0, tag_no_case("hz"))),
+    )
+    .parse(i)
+}
+
+fn gain_field(i: &str) -> IResult<&str, f64> {
+    preceded(
+        (tag_no_case("gain"), space1),
+        terminated(snum, (space0, tag_no_case("db"))),
+    )
+    .parse(i)
+}
+
+fn q_field(i: &str) -> IResult<&str, f64> {
+    preceded((tag_no_case("q"), space1), unum).parse(i)
+}
+
+/// Full filter line with a valid argument list.
+fn strict_filter(i: &str) -> IResult<&str, Line<'_>> {
+    (
+        filter_head,
+        terminated(tag_no_case("on"), space1),
+        terminated(token, space1),
+        terminated(fc_field, space1),
+        terminated(gain_field, space1),
+        q_field,
+    )
+        .map(|(_, _, kind, fc_hz, gain_db, q)| Line::Filter {
+            on: true,
+            kind,
+            args: Some((fc_hz, gain_db, q)),
+        })
+        .parse(i)
+}
+
+/// Anything recognizably a filter line, valid arguments or not. Decides
+/// *whether* a line is a filter; `strict_filter` validates the arguments.
+fn loose_filter(i: &str) -> IResult<&str, Line<'_>> {
+    (filter_head, onoff, space1, token)
+        .map(|(_, on, _, kind)| Line::Filter {
+            on,
+            kind,
+            args: None,
+        })
+        .parse(i)
+}
+
+/// `Preamp: <num> dB` — no space allowed before the colon.
+fn preamp(i: &str) -> IResult<&str, Line<'_>> {
+    terminated(
+        preceded((space0, tag_no_case("preamp"), char(':'), space0), snum),
+        (space0, tag_no_case("db")),
+    )
+    .map(Line::Preamp)
+    .parse(i)
+}
+
+/// Ordered choice; trailing content after a match is allowed, and lines
+/// matching nothing are `Other` (ignored).
+fn classify(line: &str) -> Line<'_> {
+    alt((strict_filter, loose_filter, preamp))
+        .parse(line)
+        .map_or(Line::Other, |(_, l)| l)
+}
+
+pub fn parse(text: &str) -> Result<Parsed> {
     let mut out = Parsed::default();
     let mut preamp_seen = false;
     for (idx, line) in text.lines().enumerate() {
         let n = idx + 1;
-        if let Some(c) = preamp_re.captures(line) {
-            if preamp_seen {
-                out.warnings.push(format!(
-                    "line {n}: duplicate Preamp overrides the previous one"
-                ));
+        match classify(line) {
+            Line::Preamp(v) => {
+                if preamp_seen {
+                    out.warnings.push(format!(
+                        "line {n}: duplicate Preamp overrides the previous one"
+                    ));
+                }
+                preamp_seen = true;
+                out.preset.preamp_db = v;
             }
-            preamp_seen = true;
-            out.preset.preamp_db = c[1].parse()?;
-            continue;
-        }
-        let Some(c) = loose_re.captures(line) else {
-            continue; // not a filter line: ignore
-        };
-        if c[1].eq_ignore_ascii_case("OFF") {
-            out.warnings
-                .push(format!("line {n}: filter is OFF, skipped"));
-            continue;
-        }
-        let kind = match c[2].to_ascii_uppercase().as_str() {
-            "PK" => FilterKind::Peaking,
-            "LSC" => FilterKind::LowShelf,
-            "HSC" => FilterKind::HighShelf,
-            other => {
-                out.warnings.push(format!(
-                    "line {n}: unsupported filter type {other}, skipped"
-                ));
-                continue;
+            Line::Filter { on: false, .. } => {
+                out.warnings
+                    .push(format!("line {n}: filter is OFF, skipped"));
             }
-        };
-        let Some(c) = strict_re.captures(line) else {
-            bail!("line {n}: unrecognized filter syntax: {line:?}");
-        };
-        out.preset.bands.push(Band {
-            kind,
-            fc_hz: c[1].parse()?,
-            gain_db: c[2].parse()?,
-            q: c[3].parse()?,
-        });
+            Line::Filter {
+                on: true,
+                kind,
+                args,
+            } => {
+                let kind = match kind.to_ascii_uppercase().as_str() {
+                    "PK" => FilterKind::Peaking,
+                    "LSC" => FilterKind::LowShelf,
+                    "HSC" => FilterKind::HighShelf,
+                    other => {
+                        out.warnings.push(format!(
+                            "line {n}: unsupported filter type {other}, skipped"
+                        ));
+                        continue;
+                    }
+                };
+                let Some((fc_hz, gain_db, q)) = args else {
+                    bail!("line {n}: unrecognized filter syntax: {line:?}");
+                };
+                out.preset.bands.push(Band {
+                    kind,
+                    fc_hz,
+                    gain_db,
+                    q,
+                });
+            }
+            Line::Other => {}
+        }
     }
     Ok(out)
 }
@@ -140,6 +267,25 @@ Filter 5: ON LP Fc 19000 Hz
     #[test]
     fn malformed_supported_filter_is_an_error() {
         assert!(parse("Filter 1: ON PK Fc 105 Hz").is_err());
+    }
+
+    /// Lines that are neither `Preamp:` nor `Filter N:` — comments,
+    /// AutoEQ headers, blanks, prose — are skipped without warnings and
+    /// don't disturb the filters around them.
+    #[test]
+    fn unrecognized_lines_are_silently_skipped() {
+        let text = "\
+# EQ preset for Some Headphone, generated 2026-07-21
+GraphicEQ: 20 0.0; 21 0.1; 22 0.2
+
+free-form note a human left here
+Preamp: -6.8 dB
+Filter 1: ON PK Fc 105 Hz Gain -1.1 dB Q 0.70
+";
+        let p = parse(text).unwrap();
+        assert_eq!(p.preset.preamp_db, -6.8);
+        assert_eq!(p.preset.bands.len(), 1);
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]
@@ -200,6 +346,44 @@ Filter 5: ON LP Fc 19000 Hz
                 (FilterKind::HighShelf, 10000.0, 0.2, 0.70),
             ],
         );
+    }
+
+    // Edge cases pinning quirks of the original regex grammar, so the
+    // nom port stays behavior-compatible.
+
+    #[test]
+    fn lowercase_keywords_accepted() {
+        let p = parse("preamp: -1 dB\nfilter 1: on pk fc 100 hz gain 1 db q 1.0").unwrap();
+        assert_eq!(p.preset.preamp_db, -1.0);
+        assert_eq!(p.preset.bands.len(), 1);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn no_space_between_filter_and_number() {
+        let p = parse("Filter1: ON PK Fc 100 Hz Gain 1 dB Q 1.0").unwrap();
+        assert_eq!(p.preset.bands.len(), 1);
+    }
+
+    #[test]
+    fn no_space_before_hz_and_db() {
+        let p = parse("Filter 1: ON PK Fc 100Hz Gain 1dB Q 1.0").unwrap();
+        assert_eq!(p.preset.bands.len(), 1);
+        assert_eq!(p.preset.bands[0].fc_hz, 100.0);
+        assert_eq!(p.preset.bands[0].gain_db, 1.0);
+    }
+
+    #[test]
+    fn trailing_garbage_after_q_is_ignored() {
+        let p = parse("Filter 1: ON PK Fc 100 Hz Gain 1 dB Q 1.0 whatever").unwrap();
+        assert_eq!(p.preset.bands.len(), 1);
+    }
+
+    #[test]
+    fn space_before_preamp_colon_is_not_a_preamp_line() {
+        let p = parse("Preamp : -1 dB").unwrap();
+        assert_eq!(p.preset.preamp_db, 0.0);
+        assert!(p.warnings.is_empty());
     }
 
     #[test]
