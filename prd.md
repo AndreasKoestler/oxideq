@@ -17,7 +17,7 @@ section exactly, including its checkbox steps and design decisions.**
 - [x] Task 8: Tier 1 — PipeWire virtual sink installer (`src/routing.rs`)
 - [x] Task 9: Tier 3 — pw-link auto-wiring + feedback guard
 - [x] Task 10: macOS (CoreAudio/BlackHole) verification & docs (`docs/macos.md`)
-- [ ] Task 11: README, routing tiers, performance validation docs
+- [x] Task 11: README, routing tiers, performance validation docs
 
 ## Definition of done (every task)
 
