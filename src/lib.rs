@@ -2,5 +2,6 @@
 //!
 //! Modules are added task by task; `main.rs` stays a thin dispatcher.
 
+pub mod devices;
 pub mod dsp;
 pub mod preset;
