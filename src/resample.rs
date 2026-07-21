@@ -117,6 +117,57 @@ impl Upsampler2x {
     }
 }
 
+/// Polyphase 2× decimator over the same (unscaled) halfband prototype.
+pub struct Decimator2x {
+    /// Even-index taps (the non-zero branch).
+    branch: Vec<f64>,
+    /// Center tap (≈ 0.5).
+    center: f64,
+    /// Center-branch delay in odd-phase samples: (m-1)/2 + 1.
+    center_delay: usize,
+    even: Vec<f64>,
+    odd: Vec<f64>,
+    epos: usize,
+    opos: usize,
+}
+
+impl Decimator2x {
+    pub fn new(taps: &[f64]) -> Self {
+        let m = (taps.len() - 1) / 2;
+        let branch: Vec<f64> = taps.iter().step_by(2).copied().collect();
+        let center_delay = (m - 1) / 2 + 1;
+        Self {
+            center: taps[m],
+            center_delay,
+            even: vec![0.0; branch.len()],
+            odd: vec![0.0; center_delay + 1],
+            branch,
+            epos: 0,
+            opos: 0,
+        }
+    }
+
+    /// Two consecutive 2×-rate samples in (time order), one 1×-rate
+    /// sample out.
+    #[inline]
+    pub fn push(&mut self, v0: f64, v1: f64) -> f64 {
+        let ne = self.even.len();
+        let no = self.odd.len();
+        self.even[self.epos] = v0;
+        self.odd[self.opos] = v1;
+        let mut acc = 0.0;
+        let mut idx = self.epos;
+        for &c in &self.branch {
+            acc += c * self.even[idx];
+            idx = if idx == 0 { ne - 1 } else { idx - 1 };
+        }
+        let delayed = self.odd[(self.opos + no - self.center_delay) % no];
+        self.epos = (self.epos + 1) % ne;
+        self.opos = (self.opos + 1) % no;
+        acc + self.center * delayed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +255,51 @@ mod tests {
         }
         assert!((last[0] - 1.0).abs() < 1e-5, "even phase {}", last[0]);
         assert!((last[1] - 1.0).abs() < 1e-5, "odd phase {}", last[1]);
+    }
+
+    #[test]
+    fn decimator_impulse_responses_match_tap_phases() {
+        let taps = halfband_taps(48_000.0, 20_000.0, 120.0);
+        // Impulse on the even input phase: y[t] = taps[2t].
+        let mut d = Decimator2x::new(&taps);
+        for t in 0..taps.len() {
+            let y = d.push(if t == 0 { 1.0 } else { 0.0 }, 0.0);
+            let expect = taps.get(2 * t).copied().unwrap_or(0.0);
+            assert!((y - expect).abs() < 1e-15, "even-phase sample {t}: {y}");
+        }
+        // Impulse on the odd input phase: y[t] = taps[2t-1].
+        let mut d = Decimator2x::new(&taps);
+        for t in 0..taps.len() {
+            let y = d.push(0.0, if t == 0 { 1.0 } else { 0.0 });
+            let expect = if t == 0 {
+                0.0
+            } else {
+                taps.get(2 * t - 1).copied().unwrap_or(0.0)
+            };
+            assert!((y - expect).abs() < 1e-15, "odd-phase sample {t}: {y}");
+        }
+    }
+
+    #[test]
+    fn decimator_passes_dc_and_rejects_input_nyquist() {
+        let taps = halfband_taps(48_000.0, 20_000.0, 120.0);
+        let mut d = Decimator2x::new(&taps);
+        let mut last = 0.0;
+        for _ in 0..2 * taps.len() {
+            last = d.push(1.0, 1.0);
+        }
+        assert!((last - 1.0).abs() < 1e-5, "DC gain {last}");
+
+        // +1,-1 alternating at 2·fs is a tone at fs — mid-stopband; it
+        // would alias to DC if the filter leaked.
+        let mut d = Decimator2x::new(&taps);
+        let mut peak = 0.0f64;
+        for t in 0..4 * taps.len() {
+            let y = d.push(1.0, -1.0);
+            if t > 2 * taps.len() {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!(peak < 1e-5, "stopband leak {peak}");
     }
 }
