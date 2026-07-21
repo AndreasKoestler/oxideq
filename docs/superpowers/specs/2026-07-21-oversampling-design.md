@@ -48,7 +48,7 @@ Rejected alternatives:
 | `halfband_taps(fs_in, passband_hz, atten_db) -> Vec<f64>` | Kaiser-windowed sinc, cutoff fs_in/2 (= fs_out/4), length 4k+3 so even-offset taps are exactly zero. Construction-time only. |
 | `Upsampler2x` | Polyphase 1→2. Even branch is pure delay (center tap); odd branch ≈ taps/4 multiplies. Taps scaled ×2 for interpolation gain. |
 | `Decimator2x` | Same tap set unscaled, folded 2→1. |
-| `Oversampler` | Factor 2^k: k cascaded `Upsampler2x` + k mirrored `Decimator2x`. API: `up(x: f64, out: &mut [f64; 16]) -> usize`, `down(&[f64]) -> f64`, `latency_frames() -> f64`. Knows nothing about `Stage`/EQ. Per-channel instance, `Send`. |
+| `Oversampler` | Factor 2^k: k cascaded `Upsampler2x` + k mirrored `Decimator2x`. API: `up(x: f64, out: &mut [f64; 16]) -> usize`, `down(&mut [f64; 16]) -> f64` (folds stages in place — no copy), `latency_frames() -> f64`. Knows nothing about `Stage`/EQ. Per-channel instance, `Send`. |
 
 ### `dsp.rs` changes
 
@@ -116,10 +116,14 @@ Computed at construction from the actual device rate:
    < −110 dBFS. At 4×/16× (fractional delay) assert delay-insensitive
    transparency instead: steady-state RMS gain within ±0.05 dB across the
    passband.
-3. **Cramping fix (analog-prototype oracle):** peaking fc = 18 kHz, +6 dB,
-   Q = 2 @ 44.1 k — realized gain at fc within 0.15 dB of nominal at 4×, and
-   strictly closer than the 1× result. Oracle is the RBJ analog prototype
-   magnitude |H(jω)|.
+3. **Cramping fix (analog-prototype oracle):** RBJ peaking is *exact at fc*
+   at any rate (bilinear prewarping), so cramping shows on the upper skirt,
+   which the 1× design pinches toward 0 dB at device Nyquist. Peaking
+   fc = 18 kHz, +6 dB, Q = 2 @ 44.1 k, probed at 19.5 kHz (inside the
+   resampler passband edge of 19.845 kHz at 44.1 k, so the probe measures
+   cramping rather than resampler transition droop): 4× gain within 0.2 dB
+   of the analog prototype magnitude |H(jω)|; 1× gain deviates from it by
+   > 0.5 dB (visibly cramped).
 4. **No-op:** factor 1 → bit-identical output, `os` is `None`.
 5. **Channel state independence** under oversampling.
 6. **Latency:** impulse peak lands at `round(latency_frames())` (exact at 2×).
