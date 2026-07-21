@@ -66,9 +66,18 @@ fn warn_headroom(p: &preset::Preset) {
 }
 
 fn after_start_hook(a: &cli::RunArgs) -> Option<Box<dyn FnOnce() + Send>> {
-    if a.auto_link {
-        // Real implementation lands with Tier 3 (Task 9).
-        eprintln!("--auto-link is not implemented yet; ignored");
+    if !a.auto_link {
+        return None;
     }
-    None
+    if !cfg!(target_os = "linux") {
+        eprintln!("--auto-link is Linux/PipeWire only; ignored");
+        return None;
+    }
+    let dac = a.output.clone();
+    Some(Box::new(move || {
+        if let Err(e) = oxideq::routing::auto_link(dac.as_deref()) {
+            eprintln!("auto-link failed: {e:#}");
+            eprintln!("fall back to wiring manually with qpwgraph (Tier 2)");
+        }
+    }))
 }

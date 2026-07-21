@@ -4,8 +4,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 pub const SINK_NODE: &str = "OxidEQ-Sink";
 
@@ -54,6 +56,89 @@ pub fn install_sink() -> Result<()> {
     Ok(())
 }
 
+/// Filter a `pw-link -o` / `pw-link -i` listing (one `node:port` per line)
+/// to ports whose *node* name contains `node_substr`, case-insensitively.
+/// Sorted, so FL precedes FR and zips align across nodes.
+pub fn matching_ports<'a>(listing: &'a str, node_substr: &str) -> Vec<&'a str> {
+    let needle = node_substr.to_lowercase();
+    let mut ports: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.split(':')
+                .next()
+                .is_some_and(|node| node.to_lowercase().contains(&needle))
+        })
+        .collect();
+    ports.sort_unstable();
+    ports
+}
+
+/// Tier 3: wire `OxidEQ-Sink → oxideq → dac` with pw-link, then cut any
+/// feedback links from our playback back into the OxidEQ sink (PipeWire
+/// auto-connects new streams to the default sink — which may be ours).
+pub fn auto_link(dac_substr: Option<&str>) -> Result<()> {
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        let outs = pw_link_list("-o")?;
+        let ins = pw_link_list("-i")?;
+        let sink_monitor = matching_ports(&outs, SINK_NODE);
+        let our_capture = matching_ports(&ins, "oxideq");
+        let our_playback = matching_ports(&outs, "oxideq");
+        if sink_monitor.len() < 2 || our_capture.len() < 2 || our_playback.len() < 2 {
+            continue; // streams not in the graph yet — retry
+        }
+        for (from, to) in sink_monitor.iter().zip(&our_capture) {
+            link(from, to)?;
+        }
+        match dac_substr {
+            Some(dac) => {
+                let dac_inputs: Vec<&str> = matching_ports(&ins, dac)
+                    .into_iter()
+                    .filter(|p| !p.to_lowercase().contains("oxideq"))
+                    .collect();
+                if dac_inputs.len() < 2 {
+                    bail!("output device {dac:?} has no ports in the PipeWire graph");
+                }
+                for (from, to) in our_playback.iter().zip(&dac_inputs) {
+                    link(from, to)?;
+                }
+            }
+            None => eprintln!("auto-link: no --output given; playback stays on the default target"),
+        }
+        unlink_feedback(&our_playback);
+        println!("auto-link: wired {SINK_NODE} → oxideq → output");
+        return Ok(());
+    }
+    bail!("auto-link: ports never appeared (need pw-link, the OxidEQ sink, and running streams)")
+}
+
+fn pw_link_list(flag: &str) -> Result<String> {
+    let out = Command::new("pw-link")
+        .arg(flag)
+        .output()
+        .context("running pw-link (is pipewire-utils installed?)")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn link(from: &str, to: &str) -> Result<()> {
+    // Non-zero exit for an already-existing link is fine — ignore status.
+    Command::new("pw-link")
+        .args([from, to])
+        .status()
+        .context("running pw-link")?;
+    Ok(())
+}
+
+/// Best-effort: cut playback→own-sink links that would howl.
+fn unlink_feedback(our_playback: &[&str]) {
+    for (port, chan) in our_playback.iter().zip(["FL", "FR"]) {
+        let _ = Command::new("pw-link")
+            .args(["-d", port, &format!("{SINK_NODE}:playback_{chan}")])
+            .status();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +169,47 @@ mod tests {
             p,
             Path::new("/xdg/pipewire/pipewire.conf.d/99-oxideq-sink.conf")
         );
+    }
+
+    const LISTING: &str = "\
+OxidEQ-Sink:monitor_FL
+OxidEQ-Sink:monitor_FR
+alsa_output.usb-DAC:playback_FL
+alsa_output.usb-DAC:playback_FR
+oxideq:input_FL
+oxideq:input_FR
+Firefox:output_FL
+";
+
+    #[test]
+    fn matching_ports_filters_by_node_case_insensitively() {
+        assert_eq!(
+            matching_ports(LISTING, "oxideq-sink"),
+            vec!["OxidEQ-Sink:monitor_FL", "OxidEQ-Sink:monitor_FR"]
+        );
+        assert_eq!(
+            matching_ports(LISTING, "usb-DAC"),
+            vec![
+                "alsa_output.usb-DAC:playback_FL",
+                "alsa_output.usb-DAC:playback_FR"
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_ports_is_sorted_fl_before_fr() {
+        // Reversed input order must still come out FL, FR.
+        let reversed = "oxideq:input_FR\noxideq:input_FL\n";
+        assert_eq!(
+            matching_ports(reversed, "oxideq"),
+            vec!["oxideq:input_FL", "oxideq:input_FR"]
+        );
+    }
+
+    #[test]
+    fn matching_ports_matches_node_not_port_text() {
+        // "monitor" appears in OxidEQ-Sink's *port* names only — a node
+        // filter for "monitor" must not match them.
+        assert!(matching_ports(LISTING, "monitor").is_empty());
     }
 }
