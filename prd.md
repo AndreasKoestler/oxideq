@@ -8,7 +8,7 @@ section exactly, including its checkbox steps and design decisions.**
 ## Tasks
 
 - [x] Task 1: Project scaffold (crate, deps, pre-commit hook, example preset)
-- [ ] Task 2: Equalizer APO preset parser + real-preset fixtures (`src/preset.rs`, `presets/*.txt`)
+- [x] Task 2: Equalizer APO preset parser + real-preset fixtures (`src/preset.rs`, `presets/*.txt`)
 - [ ] Task 3: DSP — pluggable `Filter` trait + preamp + f64 biquad cascade (`src/dsp.rs`)
 - [ ] Task 4: CPU & latency benchmarks + NFR guard test (`benches/dsp.rs`, `tests/perf.rs`)
 - [ ] Task 5: Device discovery & sample-rate negotiation (`src/devices.rs`)
