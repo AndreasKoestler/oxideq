@@ -26,7 +26,9 @@ input device reports and warns when the DAC cannot match it.
 
 ## Known limitations
 
-- `install-sink` and `--auto-link` are PipeWire features; on macOS they
-  print guidance instead (Tier 1/3 are Linux-only by design).
+- OxidEQ does no graph management: on Linux the virtual sink and links
+  are set up with PipeWire tooling (see the README's "Routing"); on
+  macOS, BlackHole is the sink and CoreAudio handles the default-output
+  routing.
 - Per-app routing needs third-party tools; OxidEQ EQ's whatever reaches
   BlackHole.

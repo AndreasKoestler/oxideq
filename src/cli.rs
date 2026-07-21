@@ -1,5 +1,8 @@
-//! Hand-rolled CLI parsing — the dependency budget (PRD 4.2) does not
-//! include a CLI crate, and four subcommands don't justify one.
+//! Hand-rolled CLI parsing — no CLI-crate dependency; three subcommands
+//! don't justify one.
+// AWK: Actually, use clap for this. For two reasons:
+// 1. we will be adding more options
+// 2. it will make some of the tests redundant
 
 use anyhow::{bail, Context, Result};
 
@@ -7,7 +10,6 @@ use anyhow::{bail, Context, Result};
 pub enum Cmd {
     Run(RunArgs),
     Devices,
-    InstallSink,
     Help,
 }
 
@@ -17,7 +19,6 @@ pub struct RunArgs {
     pub input: Option<String>,
     pub output: Option<String>,
     pub buffer_frames: u32,
-    pub auto_link: bool,
 }
 
 impl Default for RunArgs {
@@ -27,7 +28,6 @@ impl Default for RunArgs {
             input: None,
             output: None,
             buffer_frames: 256,
-            auto_link: false,
         }
     }
 }
@@ -37,14 +37,12 @@ oxideq — bit-perfect parametric EQ pipeline
 
 USAGE:
   oxideq run --preset <file> [--input <name>] [--output <name>]
-             [--buffer <frames>] [--auto-link]
+             [--buffer <frames>]
   oxideq devices              list audio devices
-  oxideq install-sink         create the PipeWire virtual sink (Linux)
   oxideq help
 
   --input/--output match device names case-insensitively by substring.
   --buffer sets the requested block size in frames (default 256).
-  --auto-link wires sink monitor -> oxideq -> --output via pw-link (Linux).
 ";
 
 pub fn parse(args: &[String]) -> Result<Cmd> {
@@ -52,7 +50,6 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
     match it.next() {
         None | Some("help") | Some("--help") | Some("-h") => Ok(Cmd::Help),
         Some("devices") => Ok(Cmd::Devices),
-        Some("install-sink") => Ok(Cmd::InstallSink),
         Some("run") => {
             let mut a = RunArgs::default();
             while let Some(flag) = it.next() {
@@ -69,7 +66,6 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
                             .parse()
                             .context("--buffer must be a frame count")?
                     }
-                    "--auto-link" => a.auto_link = true,
                     other => bail!("unknown flag {other:?}\n\n{USAGE}"),
                 }
             }
@@ -97,27 +93,14 @@ mod tests {
     }
 
     #[test]
-    fn devices_and_install_sink() {
+    fn devices_command() {
         assert!(matches!(parse(&s(&["devices"])).unwrap(), Cmd::Devices));
-        assert!(matches!(
-            parse(&s(&["install-sink"])).unwrap(),
-            Cmd::InstallSink
-        ));
     }
 
     #[test]
     fn run_with_all_flags() {
         let cmd = parse(&s(&[
-            "run",
-            "--preset",
-            "p.txt",
-            "--input",
-            "OxidEQ",
-            "--output",
-            "DAC",
-            "--buffer",
-            "512",
-            "--auto-link",
+            "run", "--preset", "p.txt", "--input", "OxidEQ", "--output", "DAC", "--buffer", "512",
         ]))
         .unwrap();
         let Cmd::Run(a) = cmd else {
@@ -127,7 +110,6 @@ mod tests {
         assert_eq!(a.input.as_deref(), Some("OxidEQ"));
         assert_eq!(a.output.as_deref(), Some("DAC"));
         assert_eq!(a.buffer_frames, 512);
-        assert!(a.auto_link);
     }
 
     #[test]
@@ -138,7 +120,6 @@ mod tests {
         assert_eq!(a.buffer_frames, 256);
         assert_eq!(a.input, None);
         assert_eq!(a.output, None);
-        assert!(!a.auto_link);
     }
 
     #[test]

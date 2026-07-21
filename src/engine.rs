@@ -43,16 +43,9 @@ pub fn clamp_buffer(requested: u32, supported: &SupportedBufferSize) -> BufferSi
     }
 }
 
-pub fn run(
-    input: &Device,
-    output: &Device,
-    preset: &Preset,
-    cfg: &EngineConfig,
-    after_start: Option<Box<dyn FnOnce() + Send>>,
-) -> Result<()> {
-    // Give our PipeWire node a predictable name for pw-link / qpwgraph.
-    // (pipewire-alsa reads PIPEWIRE_PROPS; harmless elsewhere.) Safe under
-    // edition 2021: `set_var` is not `unsafe` here.
+pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig) -> Result<()> {
+    // Name our PipeWire node `oxideq` so pw-link / qpwgraph can find it for
+    // manual routing. (pipewire-alsa reads PIPEWIRE_PROPS; harmless elsewhere.)
     if cfg!(target_os = "linux") {
         std::env::set_var("PIPEWIRE_PROPS", "{ node.name = oxideq }");
     }
@@ -66,12 +59,12 @@ pub fn run(
             in_default.sample_format()
         );
     }
-    // PRD 3.2: detect the source rate at runtime… (cpal 0.18: `sample_rate()`
-    // already returns a bare `u32`, so there is no `.0` field to unwrap.)
+    // Detect the source rate at runtime. (cpal 0.18 `sample_rate()` returns
+    // a bare u32 — no `.0` to unwrap.)
     let rate = in_default.sample_rate();
     let ch = cfg.channels as usize;
 
-    // …and command the output device to lock to it, warning on fallback.
+    // Ask the output device for that exact rate; warn on fallback.
     let (mut out_cfg, exact) = devices::output_config(output, rate, cfg.channels)?;
     if !exact {
         eprintln!(
@@ -113,10 +106,15 @@ pub fn run(
             in_cfg,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 for chunk in data.chunks(MAX_CALLBACK_SAMPLES) {
+                    // `data` is read-only; copy each chunk into the
+                    // pre-allocated scratch to EQ it in place. Chunking caps
+                    // the copy at scratch's size for any callback length.
                     let s = &mut scratch[..chunk.len()];
                     s.copy_from_slice(chunk);
                     chain.process(s);
                     for &x in s.iter() {
+                        // `.contains` is clippy-idiomatic and optimizes to the
+                        // same code as `x < -1.0 || x > 1.0`.
                         if !(-1.0..=1.0).contains(&x) {
                             in_stats.clipped.fetch_add(1, Ordering::Relaxed);
                         }
@@ -150,10 +148,6 @@ pub fn run(
 
     input_stream.play().context("starting input stream")?;
     output_stream.play().context("starting output stream")?;
-
-    if let Some(f) = after_start {
-        std::thread::spawn(f);
-    }
 
     let latency_ms =
         (cfg.buffer_frames as f64 * (2 + PREFILL_BLOCKS) as f64) / rate as f64 * 1_000.0;

@@ -1,4 +1,4 @@
-//! NFR guard (PRD §5): DSP < 1% of one core, sub-millisecond per block.
+//! NFR guard: DSP < 1% of one core, sub-millisecond per block.
 //! Run with:  cargo test --release --test perf -- --ignored --nocapture
 
 use std::time::Instant;

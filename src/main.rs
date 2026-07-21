@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use oxideq::{cli, devices, engine, preset};
 
@@ -10,21 +10,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         cli::Cmd::Devices => devices::list(&cpal::default_host()),
-        cli::Cmd::InstallSink => install_sink(),
         cli::Cmd::Run(a) => run(a),
     }
-}
-
-fn install_sink() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!(
-            "install-sink is Linux/PipeWire only.\n\
-             On macOS: `brew install blackhole-2ch`, set \"BlackHole 2ch\" as the\n\
-             default output, then run:\n\
-             oxideq run --preset <file> --input BlackHole --output \"<your DAC>\""
-        );
-    }
-    oxideq::routing::install_sink()
 }
 
 fn run(a: cli::RunArgs) -> Result<()> {
@@ -40,7 +27,6 @@ fn run(a: cli::RunArgs) -> Result<()> {
     let input = devices::find(&host, devices::Direction::Input, a.input.as_deref())?;
     let output = devices::find(&host, devices::Direction::Output, a.output.as_deref())?;
 
-    let after_start = after_start_hook(&a);
     engine::run(
         &input,
         &output,
@@ -49,12 +35,11 @@ fn run(a: cli::RunArgs) -> Result<()> {
             buffer_frames: a.buffer_frames,
             channels: 2,
         },
-        after_start,
     )
 }
 
-/// PRD 3.1: the preamp is the only clipping protection. If boosts exceed
-/// it, say so up front — we will never limit dynamically.
+/// The preamp is the only clipping protection — we never limit dynamically.
+/// If the loudest boost outweighs the preamp cut, warn up front.
 fn warn_headroom(p: &preset::Preset) {
     let max_boost = p.bands.iter().map(|b| b.gain_db).fold(0.0f64, f64::max);
     if max_boost + p.preamp_db > 0.0 {
@@ -63,21 +48,4 @@ fn warn_headroom(p: &preset::Preset) {
             p.preamp_db
         );
     }
-}
-
-fn after_start_hook(a: &cli::RunArgs) -> Option<Box<dyn FnOnce() + Send>> {
-    if !a.auto_link {
-        return None;
-    }
-    if !cfg!(target_os = "linux") {
-        eprintln!("--auto-link is Linux/PipeWire only; ignored");
-        return None;
-    }
-    let dac = a.output.clone();
-    Some(Box::new(move || {
-        if let Err(e) = oxideq::routing::auto_link(dac.as_deref()) {
-            eprintln!("auto-link failed: {e:#}");
-            eprintln!("fall back to wiring manually with qpwgraph (Tier 2)");
-        }
-    }))
 }

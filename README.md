@@ -11,27 +11,63 @@ processing only.
 ## Quick start (Linux / PipeWire)
 
     cargo install --path .            # or: cargo build --release
-    oxideq install-sink               # Tier 1: create the virtual sink
-    systemctl --user restart pipewire pipewire-pulse
-    # pick "OxidEQ Sink" as the default output device, then:
-    oxideq run --preset my_headphones.txt --output "<DAC name>" --auto-link
+    # 1. create the virtual sink (one-time, see "Routing" below)
+    # 2. pick "OxidEQ Sink" as the default output device, then:
+    oxideq run --preset my_headphones.txt --input OxidEQ-Sink --output "<DAC name>"
+    # 3. wire the sink's monitor into oxideq (see "Routing")
 
 Presets are standard AutoEQ output ("Equalizer APO parametric" format):
 `Preamp:` plus `PK`/`LSC`/`HSC` filter lines. Grab one from
 https://github.com/jaakkopasanen/AutoEq for your headphones.
 
-## Routing tiers
+`oxideq` names its PipeWire node `oxideq` (ports `oxideq:input_*` /
+`oxideq:output_*`), so the routing tools below can find it.
 
-1. **Virtual sink (recommended).** `oxideq install-sink` writes
-   `~/.config/pipewire/pipewire.conf.d/99-oxideq-sink.conf`. Select
-   "OxidEQ Sink" as the desktop output; oxideq EQ's its monitor into
-   the DAC.
-2. **qpwgraph profiles.** Wire `OxidEQ-Sink:monitor_* → oxideq` and
-   `oxideq → <DAC>` visually, then File → Save; enable *Patchbay →
-   Activated* so qpwgraph re-pins the links automatically on restart.
-3. **Automatic (`--auto-link`).** oxideq runs `pw-link` itself at
-   startup, including cutting accidental feedback links back into its
-   own sink.
+## Routing
+
+OxidEQ does no graph management of its own — it is a plain capture→EQ→playback
+client. Set up the sink and links with standard PipeWire tooling (this used to
+be built in as `install-sink`/`--auto-link`; it is now external so the binary
+stays a pure processor).
+
+### 1. Create the virtual sink (recommended)
+
+Write `~/.config/pipewire/pipewire.conf.d/99-oxideq-sink.conf`:
+
+    context.objects = [
+        {   factory = adapter
+            args = {
+                factory.name     = support.null-audio-sink
+                node.name        = "OxidEQ-Sink"
+                node.description = "OxidEQ Sink"
+                media.class      = Audio/Sink
+                audio.position   = [ FL FR ]
+                monitor.channel-volumes = true
+            }
+        }
+    ]
+
+Then `systemctl --user restart pipewire pipewire-pulse` and select
+"OxidEQ Sink" as the desktop's default output. Delete the file to uninstall.
+
+### 2. Wire it up
+
+**qpwgraph (GUI):** wire `OxidEQ-Sink:monitor_* → oxideq:input_*` and
+`oxideq:output_* → <DAC>:playback_*`, then File → Save and enable
+*Patchbay → Activated* so the links re-pin on restart.
+
+**pw-link (CLI):** list ports with `pw-link -o` / `pw-link -i`, then:
+
+    pw-link OxidEQ-Sink:monitor_FL oxideq:input_FL
+    pw-link OxidEQ-Sink:monitor_FR oxideq:input_FR
+    pw-link oxideq:output_FL "<DAC>:playback_FL"
+    pw-link oxideq:output_FR "<DAC>:playback_FR"
+
+If PipeWire auto-connected oxideq's playback back into the OxidEQ sink
+(a feedback loop, since it may be your default output), cut it:
+
+    pw-link -d oxideq:output_FL OxidEQ-Sink:playback_FL
+    pw-link -d oxideq:output_FR OxidEQ-Sink:playback_FR
 
 macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
 
@@ -69,7 +105,7 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
   underrun warnings mean it's too tight for your system.
 
 Always listen with `--release` builds — debug builds miss real-time
-deadlines and crackle (PRD 4.2).
+deadlines and crackle.
 
 ## Roadmap (explicit non-goals for v1)
 

@@ -101,3 +101,11 @@ _No iterations yet._
 - **Bug 2 (silent pw-link failures):** `pw_link_list` read only `out.stdout`, discarding `out.status`/`out.stderr`, so a failing `pw-link` (e.g. PipeWire not running) looked identical to "ports not registered yet" and `auto_link` burned its full retry loop before reporting a generic error. Fixed by checking `out.status.success()` and `bail!`-ing with the exit status plus trimmed stderr when it's not.
 - Added 2 regression tests to `routing::tests`: `ports_of_node_excludes_oxideq_sink_substring_collision` (reuses the existing `LISTING` const, which already mixes `oxideq:input_*` and `OxidEQ-Sink:monitor_*`, and asserts the exact-node lookup returns only the two `oxideq:*` ports) and `ports_of_node_is_case_insensitive_and_sorted`. The 3 existing `matching_ports_*` tests were left untouched and still pass.
 - Verified: `cargo test routing` (8/8 passed), full `cargo test` (35/35 passed, 1 perf test ignored by design), `cargo clippy --all-targets -- -D warnings` (clean), `cargo fmt --check` (clean). Only `src/routing.rs` was touched (plus this note).
+
+## Post-plan change: routing removed
+
+- Deleted `src/routing.rs` (Tier 1 sink installer + Tier 3 pw-link auto-wiring).
+- Removed `install-sink` subcommand and `--auto-link` flag from the CLI; dropped the now-dead `after_start` hook from `engine::run`.
+- README + docs/macos.md now document the equivalent manual setup (PipeWire null-sink drop-in + `pw-link`/qpwgraph wiring) — routing is external, the binary is a pure processor.
+- Swept comments referencing the non-checked-in PRD; kept the `oxideq` node naming (PIPEWIRE_PROPS) so external tools can find our ports.
+- 27 tests green, clippy clean, perf gate 0.182%/9.70 µs. (prd.md/plan left as historical build record.)

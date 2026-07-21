@@ -1,5 +1,5 @@
 //! Device discovery, selection by name substring, and output sample-rate
-//! negotiation (PRD 3.2: lock output to the source rate; warn on fallback).
+//! negotiation: lock the output to the source rate; warn on fallback.
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -55,7 +55,7 @@ pub fn find(host: &Host, dir: Direction, name_substr: Option<&str>) -> Result<De
 
 /// Pick an output rate given `(min, max)` supported ranges. Exact match
 /// wins (`true`); otherwise the nearest range endpoint (`false`) — the OS
-/// will resample and the caller must warn (PRD §5 reliability).
+/// will resample and the caller must warn.
 pub fn pick_rate(ranges: &[(u32, u32)], want: u32) -> Option<(u32, bool)> {
     if ranges.iter().any(|&(lo, hi)| want >= lo && want <= hi) {
         return Some((want, true));
