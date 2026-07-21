@@ -72,6 +72,51 @@ pub fn halfband_taps(fs_in: f64, passband_hz: f64, atten_db: f64) -> Vec<f64> {
     taps
 }
 
+/// Polyphase 2× interpolator. Feed one sample at fs_in, get two at
+/// 2·fs_in. Even output phase is the sinc branch; odd phase is the
+/// (scaled) center-tap delay.
+pub struct Upsampler2x {
+    /// Even-index taps of the ×2-scaled prototype (the non-zero branch).
+    branch: Vec<f64>,
+    /// ×2-scaled center tap (≈ 1.0 exactly up to window normalization).
+    center: f64,
+    /// Center-branch delay in input samples: (m-1)/2.
+    center_delay: usize,
+    /// Ring buffer of past inputs; len == branch.len().
+    buf: Vec<f64>,
+    pos: usize,
+}
+
+impl Upsampler2x {
+    pub fn new(taps: &[f64]) -> Self {
+        let m = (taps.len() - 1) / 2;
+        let branch: Vec<f64> = taps.iter().step_by(2).map(|&t| 2.0 * t).collect();
+        Self {
+            center: 2.0 * taps[m],
+            center_delay: (m - 1) / 2,
+            buf: vec![0.0; branch.len()],
+            branch,
+            pos: 0,
+        }
+    }
+
+    /// One input sample in, two output samples out, in time order.
+    #[inline]
+    pub fn push(&mut self, x: f64) -> [f64; 2] {
+        let n = self.buf.len();
+        self.buf[self.pos] = x;
+        let mut acc = 0.0;
+        let mut idx = self.pos;
+        for &c in &self.branch {
+            acc += c * self.buf[idx];
+            idx = if idx == 0 { n - 1 } else { idx - 1 };
+        }
+        let delayed = self.buf[(self.pos + n - self.center_delay) % n];
+        self.pos = (self.pos + 1) % n;
+        [acc, self.center * delayed]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +177,32 @@ mod tests {
             let g = gain_db(&t, w);
             assert!(g.abs() < 1e-4, "ripple {g} dB at w {w:.3}");
         }
+    }
+
+    #[test]
+    fn upsampler_impulse_response_is_the_scaled_prototype() {
+        let taps = halfband_taps(48_000.0, 20_000.0, 120.0);
+        let mut up = Upsampler2x::new(&taps);
+        let mut out = Vec::new();
+        for t in 0..taps.len() {
+            let x = if t == 0 { 1.0 } else { 0.0 };
+            out.extend(up.push(x));
+        }
+        // y[n] = g[n] = 2·taps[n]: the impulse response IS the filter.
+        for (n, &y) in out.iter().enumerate().take(taps.len()) {
+            assert!((y - 2.0 * taps[n]).abs() < 1e-15, "sample {n}: {y}");
+        }
+    }
+
+    #[test]
+    fn upsampler_passes_dc() {
+        let taps = halfband_taps(48_000.0, 20_000.0, 120.0);
+        let mut up = Upsampler2x::new(&taps);
+        let mut last = [0.0f64; 2];
+        for _ in 0..2 * taps.len() {
+            last = up.push(1.0);
+        }
+        assert!((last[0] - 1.0).abs() < 1e-5, "even phase {}", last[0]);
+        assert!((last[1] - 1.0).abs() < 1e-5, "odd phase {}", last[1]);
     }
 }
