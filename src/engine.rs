@@ -61,28 +61,44 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     }
     // Detect the source rate at runtime. (cpal 0.18 `sample_rate()` returns
     // a bare u32 — no `.0` to unwrap.)
-    let rate = in_default.sample_rate();
+    let want = in_default.sample_rate();
     let ch = cfg.channels as usize;
 
-    // Ask the output device for that exact rate; warn on fallback.
-    let (mut out_cfg, exact) = devices::output_config(output, rate, cfg.channels)?;
+    // One rate for the whole pipeline: the ring has no resampler, so
+    // capture and playback must open at the same rate or the ring drifts
+    // and the audio pitch-shifts.
+    let (rate, exact) = devices::negotiate_rate(input, output, want, cfg.channels)?;
     if !exact {
         eprintln!(
-            "warning: output cannot lock {rate} Hz natively; using {} Hz (system resampler engaged)",
-            out_cfg.sample_rate
+            "warning: output cannot lock {want} Hz; whole pipeline runs at {rate} Hz \
+             (the OS resamples capture — not bit-perfect)"
         );
     }
+
     let out_supported = output
         .default_output_config()
         .context("querying output config")?;
-    out_cfg.buffer_size = clamp_buffer(cfg.buffer_frames, out_supported.buffer_size());
+    let in_buf = clamp_buffer(cfg.buffer_frames, in_default.buffer_size());
+    let out_buf = clamp_buffer(cfg.buffer_frames, out_supported.buffer_size());
     let in_cfg = StreamConfig {
         channels: cfg.channels,
         sample_rate: rate,
-        buffer_size: clamp_buffer(cfg.buffer_frames, in_default.buffer_size()),
+        buffer_size: in_buf,
+    };
+    let out_cfg = StreamConfig {
+        channels: cfg.channels,
+        sample_rate: rate,
+        buffer_size: out_buf,
     };
 
-    let block = cfg.buffer_frames as usize * ch;
+    // Devices may clamp the requested block size; size the ring and report
+    // latency from what they actually use (`Default` → assume the request).
+    let fixed = |b: &BufferSize| match *b {
+        BufferSize::Fixed(n) => n,
+        BufferSize::Default => cfg.buffer_frames,
+    };
+    let frames = fixed(&in_cfg.buffer_size).max(fixed(&out_cfg.buffer_size));
+    let block = frames as usize * ch;
     let rb = HeapRb::<f32>::new(block * RING_BLOCKS);
     let (mut prod, mut cons) = rb.split();
 
@@ -99,25 +115,30 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     });
 
     // Input callback: preamp + EQ, clip count, push. RT-safe.
+    // Chunk cap rounded down to a whole frame: a chunk boundary inside a
+    // frame would run one channel's samples through another's filter state.
+    let chunk_samples = MAX_CALLBACK_SAMPLES - MAX_CALLBACK_SAMPLES % ch;
     let mut scratch = vec![0.0f32; MAX_CALLBACK_SAMPLES];
     let in_stats = Arc::clone(&stats);
     let input_stream = input
         .build_input_stream(
             in_cfg,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                for chunk in data.chunks(MAX_CALLBACK_SAMPLES) {
+                for chunk in data.chunks(chunk_samples) {
                     // `data` is read-only; copy each chunk into the
                     // pre-allocated scratch to EQ it in place. Chunking caps
                     // the copy at scratch's size for any callback length.
                     let s = &mut scratch[..chunk.len()];
                     s.copy_from_slice(chunk);
                     chain.process(s);
-                    for &x in s.iter() {
-                        // `.contains` is clippy-idiomatic and optimizes to the
-                        // same code as `x < -1.0 || x > 1.0`.
-                        if !(-1.0..=1.0).contains(&x) {
-                            in_stats.clipped.fetch_add(1, Ordering::Relaxed);
-                        }
+                    // `.contains` is clippy-idiomatic and optimizes to the
+                    // same code as `x < -1.0 || x > 1.0`. Count locally,
+                    // touch the shared atomic at most once per chunk.
+                    let clipped = s.iter().filter(|x| !(-1.0..=1.0).contains(*x)).count();
+                    if clipped > 0 {
+                        in_stats
+                            .clipped
+                            .fetch_add(clipped as u64, Ordering::Relaxed);
                     }
                     if prod.push_slice(s) < s.len() {
                         in_stats.overruns.fetch_add(1, Ordering::Relaxed);
@@ -149,11 +170,9 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     input_stream.play().context("starting input stream")?;
     output_stream.play().context("starting output stream")?;
 
-    let latency_ms =
-        (cfg.buffer_frames as f64 * (2 + PREFILL_BLOCKS) as f64) / rate as f64 * 1_000.0;
+    let latency_ms = (frames as f64 * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0;
     println!(
-        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands, block {} frames (~{latency_ms:.1} ms pipeline latency)",
-        cfg.buffer_frames
+        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
     );
 
     loop {

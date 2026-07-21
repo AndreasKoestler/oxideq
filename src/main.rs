@@ -1,14 +1,10 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 
 use oxideq::{cli, devices, engine, preset};
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&args)? {
-        cli::Cmd::Help => {
-            print!("{}", cli::USAGE);
-            Ok(())
-        }
+    match cli::Cli::parse().cmd {
         cli::Cmd::Devices => devices::list(&cpal::default_host()),
         cli::Cmd::Run(a) => run(a),
     }

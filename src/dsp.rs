@@ -26,48 +26,57 @@ pub trait Filter: Send {
     fn run(&mut self, sample: f64) -> f64;
 }
 
-/// v1 backend: Direct Form 1 biquad from the `biquad` crate.
-impl Filter for DirectForm1<f64> {
+/// One stage in the cascade. Biquads are stored concretely so the inner
+/// loop inlines them — no vtable call per sample on the v1 path; anything
+/// else plugs in through the boxed `Filter` trait. Boxing happens once at
+/// construction, never in the audio path.
+pub enum Stage {
+    Biquad(DirectForm1<f64>),
+    Custom(Box<dyn Filter>),
+}
+
+impl Stage {
     #[inline]
     fn run(&mut self, sample: f64) -> f64 {
-        Biquad::run(self, sample)
+        match self {
+            Stage::Biquad(b) => Biquad::run(b, sample),
+            Stage::Custom(f) => f.run(sample),
+        }
     }
 }
 
 pub struct EqChain {
     preamp: f64, // linear
     channels: usize,
-    /// One cascade per channel: `filters[ch][stage]`. Stages are trait
-    /// objects so non-biquad filters can plug in later; boxing happens
-    /// once at construction, never in the audio path.
-    filters: Vec<Vec<Box<dyn Filter>>>,
+    /// One cascade per channel: `stages[ch][stage]`.
+    stages: Vec<Vec<Stage>>,
 }
 
 impl EqChain {
     /// Biquad-backed chain from an APO preset (the v1 path).
     pub fn new(preset: &Preset, sample_rate_hz: f64, channels: usize) -> Result<Self> {
-        let filters = (0..channels)
+        let stages = (0..channels)
             .map(|_| {
                 preset
                     .bands
                     .iter()
                     .map(|b| {
                         let c = coefficients(b, sample_rate_hz)?;
-                        Ok(Box::new(DirectForm1::<f64>::new(c)) as Box<dyn Filter>)
+                        Ok(Stage::Biquad(DirectForm1::<f64>::new(c)))
                     })
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_filters(preset.preamp_db, filters))
+        Ok(Self::from_stages(preset.preamp_db, stages))
     }
 
-    /// Chain over arbitrary stages: `filters[ch][stage]`. The outer length
+    /// Chain over arbitrary stages: `stages[ch][stage]`. The outer length
     /// is the channel count; every channel owns its own stage instances.
-    pub fn from_filters(preamp_db: f64, filters: Vec<Vec<Box<dyn Filter>>>) -> Self {
+    pub fn from_stages(preamp_db: f64, stages: Vec<Vec<Stage>>) -> Self {
         Self {
             preamp: db_to_linear(preamp_db),
-            channels: filters.len(),
-            filters,
+            channels: stages.len(),
+            stages,
         }
     }
 
@@ -78,7 +87,7 @@ impl EqChain {
     pub fn process(&mut self, interleaved: &mut [f32]) {
         debug_assert_eq!(interleaved.len() % self.channels, 0);
         for frame in interleaved.chunks_exact_mut(self.channels) {
-            for (sample, cascade) in frame.iter_mut().zip(self.filters.iter_mut()) {
+            for (sample, cascade) in frame.iter_mut().zip(self.stages.iter_mut()) {
                 let mut x = f64::from(*sample) * self.preamp;
                 for f in cascade.iter_mut() {
                     x = f.run(x);
@@ -89,7 +98,7 @@ impl EqChain {
     }
 
     pub fn num_bands(&self) -> usize {
-        self.filters.first().map_or(0, Vec::len)
+        self.stages.first().map_or(0, Vec::len)
     }
 }
 
@@ -227,9 +236,11 @@ mod tests {
 
     #[test]
     fn custom_filters_plug_in_via_the_trait() {
-        let stages: Vec<Vec<Box<dyn Filter>>> =
-            vec![vec![Box::new(Inverter)], vec![Box::new(Inverter)]];
-        let mut chain = EqChain::from_filters(0.0, stages);
+        let stages: Vec<Vec<Stage>> = vec![
+            vec![Stage::Custom(Box::new(Inverter))],
+            vec![Stage::Custom(Box::new(Inverter))],
+        ];
+        let mut chain = EqChain::from_stages(0.0, stages);
         let mut buf = [0.25f32, -0.5, 1.0, 0.0];
         chain.process(&mut buf);
         assert_eq!(buf, [-0.25, 0.5, -1.0, 0.0]);

@@ -33,19 +33,26 @@ pub struct Parsed {
 }
 
 pub fn parse(text: &str) -> Result<Parsed> {
-    let preamp_re = Regex::new(r"(?i)^\s*Preamp:\s*(-?\d+(?:\.\d+)?)\s*dB").unwrap();
+    let preamp_re = Regex::new(r"(?i)^\s*Preamp:\s*([-+]?\d+(?:\.\d+)?)\s*dB").unwrap();
     // Loose match decides *whether* a line is a filter; strict match
     // validates the arguments of supported types.
     let loose_re = Regex::new(r"(?i)^\s*Filter\s*\d+:\s*(ON|OFF)\s+(\S+)").unwrap();
     let strict_re = Regex::new(
-        r"(?i)^\s*Filter\s*\d+:\s*ON\s+\S+\s+Fc\s+(\d+(?:\.\d+)?)\s*Hz\s+Gain\s+(-?\d+(?:\.\d+)?)\s*dB\s+Q\s+(\d+(?:\.\d+)?)",
+        r"(?i)^\s*Filter\s*\d+:\s*ON\s+\S+\s+Fc\s+(\d+(?:\.\d+)?)\s*Hz\s+Gain\s+([-+]?\d+(?:\.\d+)?)\s*dB\s+Q\s+(\d+(?:\.\d+)?)",
     )
     .unwrap();
 
     let mut out = Parsed::default();
+    let mut preamp_seen = false;
     for (idx, line) in text.lines().enumerate() {
         let n = idx + 1;
         if let Some(c) = preamp_re.captures(line) {
+            if preamp_seen {
+                out.warnings.push(format!(
+                    "line {n}: duplicate Preamp overrides the previous one"
+                ));
+            }
+            preamp_seen = true;
             out.preset.preamp_db = c[1].parse()?;
             continue;
         }
@@ -133,6 +140,21 @@ Filter 5: ON LP Fc 19000 Hz
     #[test]
     fn malformed_supported_filter_is_an_error() {
         assert!(parse("Filter 1: ON PK Fc 105 Hz").is_err());
+    }
+
+    #[test]
+    fn accepts_explicit_plus_signs() {
+        let p = parse("Preamp: +1.5 dB\nFilter 1: ON PK Fc 100 Hz Gain +2.5 dB Q 1.0").unwrap();
+        assert_eq!(p.preset.preamp_db, 1.5);
+        assert_eq!(p.preset.bands[0].gain_db, 2.5);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn duplicate_preamp_warns_and_last_wins() {
+        let p = parse("Preamp: -1 dB\nPreamp: -2 dB").unwrap();
+        assert_eq!(p.preset.preamp_db, -2.0);
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
     }
 
     #[test]

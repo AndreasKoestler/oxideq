@@ -13,12 +13,28 @@ processing only.
     cargo install --path .            # or: cargo build --release
     # 1. create the virtual sink (one-time, see "Routing" below)
     # 2. pick "OxidEQ Sink" as the default output device, then:
+    oxideq devices                    # find your DAC's name
     oxideq run --preset my_headphones.txt --input OxidEQ-Sink --output "<DAC name>"
     # 3. wire the sink's monitor into oxideq (see "Routing")
 
+## Quick start (macOS)
+
+    brew install blackhole-2ch        # virtual sink (one-time)
+    cargo install --path .
+    # System Settings → Sound → Output: "BlackHole 2ch"
+    oxideq devices                    # find your DAC's name
+    oxideq run --preset my_headphones.txt --input BlackHole --output "<DAC name>"
+
+For bit-perfect playback set BlackHole 2ch *and* the DAC to the source
+rate in Audio MIDI Setup. Details and limitations: [docs/macos.md](docs/macos.md).
+
+## Presets
+
 Presets are standard AutoEQ output ("Equalizer APO parametric" format):
 `Preamp:` plus `PK`/`LSC`/`HSC` filter lines. Grab one from
-https://github.com/jaakkopasanen/AutoEq for your headphones.
+https://github.com/jaakkopasanen/AutoEq for your headphones. Every
+filter line needs an explicit `Q` (AutoEQ always emits one); Q-less
+shorthand lines are rejected.
 
 `oxideq` names its PipeWire node `oxideq` (ports `oxideq:input_*` /
 `oxideq:output_*`), so the routing tools below can find it.
@@ -73,8 +89,11 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
 
 ## Bit-perfect notes
 
-- oxideq requests the output device at the *input's* current rate and
-  warns when the device cannot lock it (the system resampler engages).
+- oxideq runs capture and playback at one common rate, preferring the
+  source's native rate. If the output device cannot lock it, the whole
+  pipeline falls back to the nearest rate both devices support (the OS
+  resamples the capture side — no longer bit-perfect) and warns; with
+  no common rate at all it exits with an error instead of drifting.
 - With a null sink, PipeWire still resamples *sources* into the graph
   rate. For true end-to-end rate lock, allow the graph to follow
   sources — e.g. `~/.config/pipewire/pipewire.conf.d/10-rates.conf`:

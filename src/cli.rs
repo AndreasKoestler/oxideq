@@ -1,109 +1,60 @@
-//! Hand-rolled CLI parsing — no CLI-crate dependency; three subcommands
-//! don't justify one.
-// AWK: Actually, use clap for this. For two reasons:
-// 1. we will be adding more options
-// 2. it will make some of the tests redundant
+//! CLI definition (clap derive). `Cli::parse()` handles help/version and
+//! exits on bad input; tests go through `try_parse_from`.
 
-use anyhow::{bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Parser)]
+#[command(name = "oxideq", version, about = "Bit-perfect parametric EQ pipeline")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub cmd: Cmd,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Cmd {
+    /// Run the EQ pipeline
     Run(RunArgs),
+    /// List audio devices
     Devices,
-    Help,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Args, PartialEq)]
 pub struct RunArgs {
+    /// Equalizer APO / AutoEQ preset file
+    #[arg(long)]
     pub preset: String,
+    /// Input device name substring, case-insensitive (default: system input)
+    #[arg(long)]
     pub input: Option<String>,
+    /// Output device name substring, case-insensitive (default: system output)
+    #[arg(long)]
     pub output: Option<String>,
+    /// Requested block size in frames
+    #[arg(long = "buffer", value_name = "FRAMES", default_value_t = 256)]
     pub buffer_frames: u32,
-}
-
-impl Default for RunArgs {
-    fn default() -> Self {
-        Self {
-            preset: String::new(),
-            input: None,
-            output: None,
-            buffer_frames: 256,
-        }
-    }
-}
-
-pub const USAGE: &str = "\
-oxideq — bit-perfect parametric EQ pipeline
-
-USAGE:
-  oxideq run --preset <file> [--input <name>] [--output <name>]
-             [--buffer <frames>]
-  oxideq devices              list audio devices
-  oxideq help
-
-  --input/--output match device names case-insensitively by substring.
-  --buffer sets the requested block size in frames (default 256).
-";
-
-pub fn parse(args: &[String]) -> Result<Cmd> {
-    let mut it = args.iter().map(String::as_str);
-    match it.next() {
-        None | Some("help") | Some("--help") | Some("-h") => Ok(Cmd::Help),
-        Some("devices") => Ok(Cmd::Devices),
-        Some("run") => {
-            let mut a = RunArgs::default();
-            while let Some(flag) = it.next() {
-                match flag {
-                    "--preset" => a.preset = it.next().context("--preset needs a value")?.into(),
-                    "--input" => a.input = Some(it.next().context("--input needs a value")?.into()),
-                    "--output" => {
-                        a.output = Some(it.next().context("--output needs a value")?.into())
-                    }
-                    "--buffer" => {
-                        a.buffer_frames = it
-                            .next()
-                            .context("--buffer needs a value")?
-                            .parse()
-                            .context("--buffer must be a frame count")?
-                    }
-                    other => bail!("unknown flag {other:?}\n\n{USAGE}"),
-                }
-            }
-            if a.preset.is_empty() {
-                bail!("run requires --preset <file>\n\n{USAGE}");
-            }
-            Ok(Cmd::Run(a))
-        }
-        Some(other) => bail!("unknown command {other:?}\n\n{USAGE}"),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn s(a: &[&str]) -> Vec<String> {
-        a.iter().map(|x| x.to_string()).collect()
-    }
-
-    #[test]
-    fn no_args_is_help() {
-        assert!(matches!(parse(&[]).unwrap(), Cmd::Help));
-        assert!(matches!(parse(&s(&["--help"])).unwrap(), Cmd::Help));
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("oxideq").chain(args.iter().copied()))
     }
 
     #[test]
     fn devices_command() {
-        assert!(matches!(parse(&s(&["devices"])).unwrap(), Cmd::Devices));
+        assert!(matches!(parse(&["devices"]).unwrap().cmd, Cmd::Devices));
     }
 
     #[test]
     fn run_with_all_flags() {
-        let cmd = parse(&s(&[
+        let Cmd::Run(a) = parse(&[
             "run", "--preset", "p.txt", "--input", "OxidEQ", "--output", "DAC", "--buffer", "512",
-        ]))
-        .unwrap();
-        let Cmd::Run(a) = cmd else {
+        ])
+        .unwrap()
+        .cmd
+        else {
             panic!("expected Run")
         };
         assert_eq!(a.preset, "p.txt");
@@ -114,7 +65,7 @@ mod tests {
 
     #[test]
     fn run_defaults() {
-        let Cmd::Run(a) = parse(&s(&["run", "--preset", "p.txt"])).unwrap() else {
+        let Cmd::Run(a) = parse(&["run", "--preset", "p.txt"]).unwrap().cmd else {
             panic!("expected Run")
         };
         assert_eq!(a.buffer_frames, 256);
@@ -124,12 +75,12 @@ mod tests {
 
     #[test]
     fn run_without_preset_is_an_error() {
-        assert!(parse(&s(&["run"])).is_err());
+        assert!(parse(&["run"]).is_err());
     }
 
     #[test]
     fn unknown_flag_is_an_error() {
-        assert!(parse(&s(&["run", "--preset", "p.txt", "--frob"])).is_err());
-        assert!(parse(&s(&["frobnicate"])).is_err());
+        assert!(parse(&["run", "--preset", "p.txt", "--frob"]).is_err());
+        assert!(parse(&["frobnicate"]).is_err());
     }
 }

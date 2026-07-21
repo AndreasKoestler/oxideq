@@ -21,8 +21,10 @@ loopback device comes from [BlackHole](https://github.com/ExistentialAudio/Black
 
 CoreAudio devices follow their configured rate in Audio MIDI Setup.
 For bit-perfect operation, set BlackHole 2ch *and* the DAC to the
-source rate there; OxidEQ locks its output stream to whatever rate the
-input device reports and warns when the DAC cannot match it.
+source rate there. OxidEQ runs its whole pipeline at the rate the
+input device reports; if the DAC cannot lock it, both streams fall
+back to the nearest rate the two devices share (CoreAudio resamples —
+not bit-perfect) and a warning is printed. No common rate is an error.
 
 ## Known limitations
 
