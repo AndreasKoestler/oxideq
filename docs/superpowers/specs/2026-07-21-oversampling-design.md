@@ -66,7 +66,9 @@ Rejected alternatives:
 
 ```
 f32 in → f64 → ×preamp → up2x → up2x → [4 samples @ 4fs]
-       → biquad cascade (@ 4fs) ×4 → down2x → down2x → f32 out
+       → each sample once through the biquad cascade (one instance
+         per channel, coefficients designed at 4fs; 4 runs per input
+         sample) → down2x → down2x → f32 out
 ```
 
 ### CLI / engine integration
