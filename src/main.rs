@@ -16,8 +16,15 @@ fn main() -> Result<()> {
 }
 
 fn install_sink() -> Result<()> {
-    // Real implementation lands with the routing module (Task 8).
-    bail!("install-sink is not implemented yet")
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "install-sink is Linux/PipeWire only.\n\
+             On macOS: `brew install blackhole-2ch`, set \"BlackHole 2ch\" as the\n\
+             default output, then run:\n\
+             oxideq run --preset <file> --input BlackHole --output \"<your DAC>\""
+        );
+    }
+    oxideq::routing::install_sink()
 }
 
 fn run(a: cli::RunArgs) -> Result<()> {
