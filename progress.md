@@ -23,3 +23,11 @@ _No iterations yet._
 - Parsing rules implemented exactly per plan: `Preamp:` sets `preamp_db` (default 0.0 if absent); `ON PK/LSC/HSC` → `Band`; `OFF` and unsupported types (e.g. `LP`) → skipped with a line-numbered warning; a supported type with malformed args → hard `bail!` error; all other lines ignored silently.
 - Gotcha: the brief's verbatim code block is not byte-identical to `rustfmt` output (line-wrapping of `assert_eq!`/`push(format!(...))` calls) — ran `cargo fmt` after pasting to satisfy the pre-commit hook's `fmt --check`; this is whitespace-only, no semantic change, so it does not violate "match the brief exactly."
 - Verified `cargo test` (7/7 preset tests + 0 others, all green), `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` all pass clean before committing.
+
+## Iteration 3
+
+- TDD: wrote `src/dsp.rs` with only the 8-test module first, confirmed RED via `cargo test dsp` (compile errors: `EqChain`/`Filter` undefined), then prepended `db_to_linear`, the `Filter` trait, its `DirectForm1<f64>` impl, `EqChain::{new, from_filters, process, num_bands}`, and the `coefficients` helper; confirmed GREEN (8 passed, 15/15 total).
+- biquad-0.6 drift check: verified the installed 0.6.0 source directly — `Coefficients::<f64>::from_params(Type<C>, Hertz<C>, Hertz<C>, C) -> Result<_, Errors>`, `Errors::{OutsideNyquist, NegativeQ, NegativeFrequency}` (derives Debug for `{e:?}`), `ToHertz::hz()`, `DirectForm1::<f64>::new`, `Biquad::run`. The brief's code compiles verbatim; NO adaptation was needed (Fc 30 kHz @ 48 kHz → `OutsideNyquist`, so `rejects_band_above_nyquist` passes).
+- RT-safety: `process` and `Filter::run` are alloc/lock/I/O-free (only `chunks_exact_mut`/`iter_mut`/`zip` + f64 arithmetic + register widen/narrow); all boxing/`Vec` allocation happens in `new`/`from_filters`. f64 for all arithmetic/coeffs/state; f32 only at the buffer boundary.
+- Gotcha (same as Iteration 2): the brief's verbatim test literals are not byte-identical to `rustfmt` output (struct/`assert_eq!` reflow), so ran `cargo fmt` after pasting to satisfy the hook's `fmt --check`; whitespace-only, no semantic change, 8 tests unchanged behaviorally.
+- Verified `cargo test` (15/15 green), `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` all pass clean before committing.
