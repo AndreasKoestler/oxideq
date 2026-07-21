@@ -31,3 +31,11 @@ _No iterations yet._
 - RT-safety: `process` and `Filter::run` are alloc/lock/I/O-free (only `chunks_exact_mut`/`iter_mut`/`zip` + f64 arithmetic + register widen/narrow); all boxing/`Vec` allocation happens in `new`/`from_filters`. f64 for all arithmetic/coeffs/state; f32 only at the buffer boundary.
 - Gotcha (same as Iteration 2): the brief's verbatim test literals are not byte-identical to `rustfmt` output (struct/`assert_eq!` reflow), so ran `cargo fmt` after pasting to satisfy the hook's `fmt --check`; whitespace-only, no semantic change, 8 tests unchanged behaviorally.
 - Verified `cargo test` (15/15 green), `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` all pass clean before committing.
+
+## Iteration 4
+
+- `cargo add --dev criterion` (resolved 0.8.2), appended `[[bench]] name = "dsp" harness = false` to `Cargo.toml`; criterion stays dev-only, runtime deps unchanged (cpal/biquad/ringbuf/regex/anyhow).
+- Wrote `benches/dsp.rs` (criterion, 10-band fixture via `include_str!("../presets/example.txt")`, black-boxed `chain.process`) and `tests/perf.rs` (ignored-by-default NFR guard: 10 s of 256-frame stereo blocks after 1,000-block warm-up) verbatim from the brief.
+- **Measured NFR baseline (this machine):** `cargo bench --bench dsp` → `time: [5.6805 µs 5.6969 µs 5.7156 µs]` (median 5.6969 µs/iter, thrpt ≈ 44.9 Melem/s). `cargo test --release --test perf -- --ignored --nocapture` → `dsp: 0.184% of one core, 9.80 µs per 256-frame block` — PASSED (well under the <1%-of-one-core and <1 ms/block NFR gates; both figures land inside the brief's expected 2–10 µs/block range).
+- Confirmed default `cargo test` reports `dsp_meets_cpu_and_latency_budget ... ignored, wall-clock timing: run explicitly with --release` while all 15 other tests stay green — the perf gate never runs in the normal suite/hook.
+- Gotcha (same as Iterations 2–3): the brief's verbatim `assert_eq!(parsed.preset.bands.len(), 10, "...")` one-liner in `benches/dsp.rs` exceeds rustfmt's line width and gets reflowed to a multi-line call; ran `cargo fmt` after pasting — whitespace-only, no semantic change.
