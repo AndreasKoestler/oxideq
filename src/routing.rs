@@ -74,6 +74,26 @@ pub fn matching_ports<'a>(listing: &'a str, node_substr: &str) -> Vec<&'a str> {
     ports
 }
 
+/// Filter a `pw-link -o` / `pw-link -i` listing to ports whose *node* name
+/// *exactly* equals `node`, case-insensitively. Unlike `matching_ports`,
+/// this never matches a node whose name merely contains `node` as a
+/// substring — e.g. `ports_of_node(listing, "oxideq")` matches the
+/// `oxideq:*` client ports but never `OxidEQ-Sink:*`, whereas
+/// `matching_ports` would wrongly match both. Sorted, so FL precedes FR.
+fn ports_of_node<'a>(listing: &'a str, node: &str) -> Vec<&'a str> {
+    let mut ports: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.split(':')
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case(node))
+        })
+        .collect();
+    ports.sort_unstable();
+    ports
+}
+
 /// Tier 3: wire `OxidEQ-Sink → oxideq → dac` with pw-link, then cut any
 /// feedback links from our playback back into the OxidEQ sink (PipeWire
 /// auto-connects new streams to the default sink — which may be ours).
@@ -83,8 +103,10 @@ pub fn auto_link(dac_substr: Option<&str>) -> Result<()> {
         let outs = pw_link_list("-o")?;
         let ins = pw_link_list("-i")?;
         let sink_monitor = matching_ports(&outs, SINK_NODE);
-        let our_capture = matching_ports(&ins, "oxideq");
-        let our_playback = matching_ports(&outs, "oxideq");
+        // Exact node match: `matching_ports` would also pull in
+        // `OxidEQ-Sink:*` here, since "oxideq-sink" contains "oxideq".
+        let our_capture = ports_of_node(&ins, "oxideq");
+        let our_playback = ports_of_node(&outs, "oxideq");
         if sink_monitor.len() < 2 || our_capture.len() < 2 || our_playback.len() < 2 {
             continue; // streams not in the graph yet — retry
         }
@@ -118,6 +140,13 @@ fn pw_link_list(flag: &str) -> Result<String> {
         .arg(flag)
         .output()
         .context("running pw-link (is pipewire-utils installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "pw-link {flag} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -211,5 +240,27 @@ Firefox:output_FL
         // "monitor" appears in OxidEQ-Sink's *port* names only — a node
         // filter for "monitor" must not match them.
         assert!(matching_ports(LISTING, "monitor").is_empty());
+    }
+
+    #[test]
+    fn ports_of_node_excludes_oxideq_sink_substring_collision() {
+        // Regression for the auto_link bug: matching_ports(listing, "oxideq")
+        // would ALSO match "OxidEQ-Sink" (substring match), pulling the
+        // sink's own monitor ports into what should be the client node's
+        // ports. ports_of_node compares the node segment exactly, so it
+        // must return only the two real `oxideq:*` ports and none of
+        // `OxidEQ-Sink`'s.
+        let matched = ports_of_node(LISTING, "oxideq");
+        assert_eq!(matched, vec!["oxideq:input_FL", "oxideq:input_FR"]);
+        assert!(matched.iter().all(|p| !p.starts_with("OxidEQ-Sink")));
+    }
+
+    #[test]
+    fn ports_of_node_is_case_insensitive_and_sorted() {
+        let reversed = "oxideq:input_FR\noxideq:input_FL\n";
+        assert_eq!(
+            ports_of_node(reversed, "OXIDEQ"),
+            vec!["oxideq:input_FL", "oxideq:input_FR"]
+        );
     }
 }
