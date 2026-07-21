@@ -106,18 +106,54 @@ Computed at construction from the actual device rate:
 
 ## Testing
 
+### Example-based
+
 1. **Tap invariants:** symmetry, even-offset zeros, DC gain (2 up / 1 down),
-   stopband ≥ 118 dB via DFT probe.
+   stopband ≥ 118 dB via DFT probe. Parametrized over the supported device
+   rates; deterministic per config.
 2. **Round-trip transparency:** at 2× (integer delay) a passband sine through
    up→down (no EQ) equals input shifted by `latency_frames()`, residual
    < −110 dBFS. At 4×/16× (fractional delay) assert delay-insensitive
    transparency instead: steady-state RMS gain within ±0.05 dB across the
    passband.
-3. **Cramping fix:** peaking fc = 18 kHz, +6 dB, Q = 2 @ 44.1 k — realized
-   gain at fc within 0.15 dB of nominal at 4×, and strictly closer than the
-   1× result.
+3. **Cramping fix (analog-prototype oracle):** peaking fc = 18 kHz, +6 dB,
+   Q = 2 @ 44.1 k — realized gain at fc within 0.15 dB of nominal at 4×, and
+   strictly closer than the 1× result. Oracle is the RBJ analog prototype
+   magnitude |H(jω)|.
 4. **No-op:** factor 1 → bit-identical output, `os` is `None`.
 5. **Channel state independence** under oversampling.
-6. **CLI:** accepts {1, 2, 4, 8, 16}; rejects 0, 3, 32.
-7. **Latency:** impulse peak lands at `round(latency_frames())` (exact at 2×).
-8. **Bench:** `benches/dsp.rs` gains 1×/4×/16× cases.
+6. **Latency:** impulse peak lands at `round(latency_frames())` (exact at 2×).
+7. **Bench:** `benches/dsp.rs` gains 1×/4×/16× cases.
+
+### Golden-vector oracle (scipy)
+
+Offline Python script (checked in) generates fixtures in `tests/data/`:
+
+- Taps must match `scipy.signal.firwin(n, 0.5, window=('kaiser', beta))`
+  to ~1e-15 (same Kaiser-sinc math, independent implementation).
+- Upsampler waveform vs `scipy.signal.upfirdn(taps, x, up=2)`,
+  sample-by-sample, tolerance ~1e-12.
+- EQ waveform vs RBJ coefficients computed independently in Python +
+  `scipy.signal.lfilter` — also cross-checks the `biquad` crate's
+  coefficient math.
+
+Python runs only at fixture-generation time, never during `cargo test`.
+
+### Property-based (`proptest`, dev-dependency)
+
+Random strategy → invariant; tolerances sized to absorb float noise scaling
+with cascade length and gain (too-tight bounds cause flaky shrink storms).
+Signal-level properties capped at ~32 cases for wall-time; commit
+`proptest-regressions` files when failures are found.
+
+- **Linearity:** random signals a, b; random valid bands; random factor
+  ∈ {1, 2, 4, 8, 16} → `process(a+b) ≈ process(a) + process(b)`.
+- **Time-invariance:** random signal, random shift k → shifted input yields
+  shifted output.
+- **Mode cross-consistency:** random fc ∈ [20 Hz, 2 kHz], Q ∈ [0.3, 3],
+  gain ∈ [−12, +12] dB → 1× and 4× steady-state gains match within 0.05 dB
+  (cramping negligible at low fc; catches coefficient-rate plumbing bugs).
+- **Transfer-function oracle:** random band params → measured steady-state
+  sine gain ≈ H(e^jω) evaluated directly from the designed coefficients
+  (catches delay-line/state bugs that tap-level tests miss).
+- **CLI:** random u32 accepted iff ∈ {1, 2, 4, 8, 16}.
