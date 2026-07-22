@@ -1,9 +1,30 @@
 //! CLI definition (clap derive). `Cli::parse()` handles help/version and
 //! exits on bad input; tests go through `try_parse_from`.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::dsp::Backend;
+
+/// CLI mirror of [`Backend`] so `clap` can render `[possible values: …]`
+/// and drive shell completion without coupling the `dsp` module to clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendArg {
+    /// Direct Form 1 biquad (default; bit-perfect at `--oversample 1`).
+    #[value(name = "df1")]
+    Df1,
+    /// Direct Form 2 transposed biquad.
+    #[value(name = "df2")]
+    Df2,
+}
+
+impl From<BackendArg> for Backend {
+    fn from(arg: BackendArg) -> Self {
+        match arg {
+            BackendArg::Df1 => Backend::Df1,
+            BackendArg::Df2 => Backend::Df2,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "oxideq", version, about = "Bit-perfect parametric EQ pipeline")]
@@ -37,9 +58,9 @@ pub struct RunArgs {
     /// Oversample the EQ cascade by this factor (1 = off, bit-perfect)
     #[arg(long, default_value_t = 1, value_parser = parse_oversample)]
     pub oversample: usize,
-    /// Biquad backend: df1 (Direct Form 1, default) or df2 (Direct Form 2 transposed)
-    #[arg(long, default_value = "df1", value_parser = parse_backend)]
-    pub backend: Backend,
+    /// Biquad realization to run the cascade with
+    #[arg(long, value_enum, default_value = "df1", ignore_case = true)]
+    pub backend: BackendArg,
 }
 
 fn parse_oversample(s: &str) -> Result<usize, String> {
@@ -47,14 +68,6 @@ fn parse_oversample(s: &str) -> Result<usize, String> {
         Ok(n @ (1 | 2 | 4 | 8 | 16)) => Ok(n),
         Ok(n) => Err(format!("must be 1, 2, 4, 8, or 16 (got {n})")),
         Err(e) => Err(e.to_string()),
-    }
-}
-
-fn parse_backend(s: &str) -> Result<Backend, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "df1" => Ok(Backend::Df1),
-        "df2" => Ok(Backend::Df2),
-        other => Err(format!("must be df1 or df2 (got {other:?})")),
     }
 }
 
@@ -138,9 +151,9 @@ mod tests {
     #[test]
     fn backend_accepts_df1_df2_and_defaults_to_df1() {
         for (arg, want) in [
-            ("df1", Backend::Df1),
-            ("df2", Backend::Df2),
-            ("DF2", Backend::Df2), // case-insensitive
+            ("df1", BackendArg::Df1),
+            ("df2", BackendArg::Df2),
+            ("DF2", BackendArg::Df2), // case-insensitive
         ] {
             let Cmd::Run(a) = parse(&["run", "--preset", "p.txt", "--backend", arg])
                 .unwrap()
@@ -153,7 +166,7 @@ mod tests {
         let Cmd::Run(a) = parse(&["run", "--preset", "p.txt"]).unwrap().cmd else {
             panic!("expected Run")
         };
-        assert_eq!(a.backend, Backend::Df1, "default backend");
+        assert_eq!(a.backend, BackendArg::Df1, "default backend");
     }
 
     #[test]
