@@ -6,7 +6,7 @@
 //! (no-oversampling) line below; the `4x`/`16x` lines are informational —
 //! oversampling is opt-in and not covered by the bit-perfect-path NFR.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use oxideq::dsp::EqChain;

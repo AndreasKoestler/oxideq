@@ -1,4 +1,4 @@
-//! OxidEQ — bit-perfect parametric EQ pipeline.
+//! `OxidEQ` — bit-perfect parametric EQ pipeline.
 //!
 //! `main.rs` stays a thin dispatcher; the logic lives in these modules.
 

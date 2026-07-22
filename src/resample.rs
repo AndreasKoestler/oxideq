@@ -41,6 +41,7 @@ fn bessel_i0(x: f64) -> f64 {
 /// the polyphase odd branch degenerates to the center tap (pure delay).
 /// Normalized to unity DC gain (`sum == 1`), matching
 /// `scipy.signal.firwin`'s default scaling.
+#[must_use]
 pub fn halfband_taps(fs_in: f64, passband_hz: f64, atten_db: f64) -> Vec<f64> {
     let fp = passband_hz.min(0.45 * fs_in);
     // Transition width fs_in - 2·fp Hz, normalized to the output rate
@@ -76,8 +77,8 @@ pub fn halfband_taps(fs_in: f64, passband_hz: f64, atten_db: f64) -> Vec<f64> {
     taps
 }
 
-/// Polyphase 2× interpolator. Feed one sample at fs_in, get two at
-/// 2·fs_in. Even output phase is the sinc branch; odd phase is the
+/// Polyphase 2× interpolator. Feed one sample at `fs_in`, get two at
+/// `2·fs_in`. Even output phase is the sinc branch; odd phase is the
 /// (scaled) center-tap delay.
 #[derive(Debug)]
 pub struct Upsampler2x {
@@ -87,12 +88,13 @@ pub struct Upsampler2x {
     center: f64,
     /// Center-branch delay in input samples: (m-1)/2.
     center_delay: usize,
-    /// Ring buffer of past inputs; len == branch.len().
+    /// Ring buffer of past inputs; len == `branch.len()`.
     buf: Vec<f64>,
     pos: usize,
 }
 
 impl Upsampler2x {
+    #[must_use]
     pub fn new(taps: &[f64]) -> Self {
         debug_assert!(
             taps.len() % 4 == 3,
@@ -143,6 +145,7 @@ pub struct Decimator2x {
 }
 
 impl Decimator2x {
+    #[must_use]
     pub fn new(taps: &[f64]) -> Self {
         debug_assert!(
             taps.len() % 4 == 3,
@@ -198,6 +201,10 @@ pub struct Oversampler {
 impl Oversampler {
     /// `factor` must be 2, 4, 8, or 16 — validated by the caller
     /// (`EqChain::new`); this constructor panics on anything else.
+    ///
+    /// # Panics
+    /// Panics if `factor` is not one of 2, 4, 8, or 16.
+    #[must_use]
     pub fn new(factor: usize, device_rate: f64) -> Self {
         assert!(
             matches!(factor, 2 | 4 | 8 | 16),
@@ -262,6 +269,7 @@ impl Oversampler {
 
     /// Total group delay in device-rate frames. Integer at 2×,
     /// fractional at higher factors.
+    #[must_use]
     pub fn latency_frames(&self) -> f64 {
         self.latency
     }

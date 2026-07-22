@@ -43,7 +43,7 @@ pub enum Cmd {
 
 #[derive(Debug, Args, PartialEq)]
 pub struct RunArgs {
-    /// Equalizer APO / AutoEQ preset file
+    /// Equalizer APO / `AutoEQ` preset file
     #[arg(long)]
     pub preset: String,
     /// Input device name substring, case-insensitive (default: system input)

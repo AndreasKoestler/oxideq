@@ -6,12 +6,13 @@
 //! audio callback. Buffers are f32 (device format); all arithmetic,
 //! coefficients, and state are f64.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use biquad::{Biquad, Coefficients, DirectForm1, DirectForm2Transposed, ToHertz, Type};
 
 use crate::preset::{Band, FilterKind, Preset};
-use crate::resample::{Oversampler, MAX_FACTOR};
+use crate::resample::{MAX_FACTOR, Oversampler};
 
+#[must_use]
 pub fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
@@ -27,6 +28,10 @@ pub trait Filter: Send {
 /// rate. This is the bound the preset-driven constructor needs; a bare
 /// `Filter` (e.g. a test fixture) need not implement it.
 pub trait BandFilter: Filter + Sized {
+    /// Design this filter from a preset band at sample rate `fs`.
+    ///
+    /// # Errors
+    /// Returns an error if the band's parameters yield invalid coefficients.
     fn from_band(band: &Band, fs: f64) -> Result<Self>;
 }
 
@@ -217,6 +222,10 @@ impl EqChain {
     /// Preset-driven chain with the default backend (`Df1`). `oversample`
     /// ∈ {1,2,4,8,16}: above 1 the cascade runs at `oversample × sample_rate_hz`
     /// behind halfband resamplers.
+    ///
+    /// # Errors
+    /// Returns an error if `oversample` is not a supported factor, or if any
+    /// band's Fc is at/above the device Nyquist or yields invalid coefficients.
     pub fn new(
         preset: &Preset,
         sample_rate_hz: f64,
@@ -233,6 +242,9 @@ impl EqChain {
     }
 
     /// As `new`, with an explicit filter backend.
+    ///
+    /// # Errors
+    /// Same conditions as [`EqChain::new`].
     pub fn with_backend(
         preset: &Preset,
         sample_rate_hz: f64,
@@ -265,6 +277,7 @@ impl EqChain {
         }
     }
 
+    #[must_use]
     pub fn num_bands(&self) -> usize {
         match self {
             EqChain::Df1(c) => c.num_bands(),
@@ -273,6 +286,7 @@ impl EqChain {
     }
 
     /// Resampler group delay in device-rate frames (0.0 when oversampling is off).
+    #[must_use]
     pub fn latency_frames(&self) -> f64 {
         match self {
             EqChain::Df1(c) => c.latency_frames(),
@@ -309,7 +323,7 @@ mod tests {
 
     /// Steady-state gain of `preset` at `freq`, in dB (second half of 1 s).
     fn gain_db_at(preset: &Preset, freq: f32, fs: f32) -> f32 {
-        let mut chain = EqChain::new(preset, fs as f64, 1, 1).unwrap();
+        let mut chain = EqChain::new(preset, f64::from(fs), 1, 1).unwrap();
         let input = sine(freq, fs, 1.0);
         let mut output = input.clone();
         chain.process(&mut output);
@@ -328,7 +342,7 @@ mod tests {
 
     /// Steady-state gain like `gain_db_at`, with an oversample factor.
     fn gain_db_at_os(preset: &Preset, freq: f32, fs: f32, factor: usize) -> f32 {
-        let mut chain = EqChain::new(preset, fs as f64, 1, factor).unwrap();
+        let mut chain = EqChain::new(preset, f64::from(fs), 1, factor).unwrap();
         let input = sine(freq, fs, 1.0);
         let mut output = input.clone();
         chain.process(&mut output);

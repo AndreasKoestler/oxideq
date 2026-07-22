@@ -1,6 +1,6 @@
-//! Equalizer APO / AutoEQ preset parsing.
+//! Equalizer APO / `AutoEQ` preset parsing.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use nom::branch::alt;
 use nom::bytes::complete::{tag_no_case, take_while1};
 use nom::character::complete::{char, digit1, one_of, space0, space1};
@@ -126,7 +126,7 @@ fn strict_filter(i: &str) -> IResult<&str, Line<'_>> {
         terminated(gain_field, space1),
         q_field,
     )
-        .map(|(_, _, kind, fc_hz, gain_db, q)| Line::Filter {
+        .map(|((), _, kind, fc_hz, gain_db, q)| Line::Filter {
             on: true,
             kind,
             args: Some((fc_hz, gain_db, q)),
@@ -138,7 +138,7 @@ fn strict_filter(i: &str) -> IResult<&str, Line<'_>> {
 /// *whether* a line is a filter; `strict_filter` validates the arguments.
 fn loose_filter(i: &str) -> IResult<&str, Line<'_>> {
     (filter_head, onoff, space1, token)
-        .map(|(_, on, _, kind)| Line::Filter {
+        .map(|((), on, _, kind)| Line::Filter {
             on,
             kind,
             args: None,
@@ -164,6 +164,11 @@ fn classify(line: &str) -> Line<'_> {
         .map_or(Line::Other, |(_, l)| l)
 }
 
+/// Parse an Equalizer APO / `AutoEQ` preset into bands plus warnings.
+///
+/// # Errors
+/// Returns an error on a line that is recognizably a filter but whose
+/// argument list is malformed (e.g. missing Gain/Q).
 pub fn parse(text: &str) -> Result<Parsed> {
     let mut out = Parsed::default();
     let mut preamp_seen = false;
@@ -270,7 +275,7 @@ Filter 5: ON LP Fc 19000 Hz
     }
 
     /// Lines that are neither `Preamp:` nor `Filter N:` — comments,
-    /// AutoEQ headers, blanks, prose — are skipped without warnings and
+    /// `AutoEQ` headers, blanks, prose — are skipped without warnings and
     /// don't disturb the filters around them.
     #[test]
     fn unrecognized_lines_are_silently_skipped() {
