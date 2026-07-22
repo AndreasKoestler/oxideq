@@ -18,6 +18,7 @@ codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.8.2"
+proptest = "1"
 
 [[bench]]
 name = "dsp"
