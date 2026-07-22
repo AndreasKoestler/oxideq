@@ -7,7 +7,6 @@
 use std::f64::consts::PI;
 
 /// Stopband attenuation target for every halfband stage, dB.
-#[allow(dead_code)] // consumed by the resampler stages built in Task 4
 const ATTEN_DB: f64 = 120.0;
 
 /// Maximum supported oversampling factor (2^4).
@@ -168,6 +167,88 @@ impl Decimator2x {
     }
 }
 
+/// Cascaded halfband stages for oversampling by 2^k, k in 1..=4.
+/// Stage `s` (0-based) resamples between `device_rate·2^s` and
+/// `device_rate·2^(s+1)`.
+pub struct Oversampler {
+    up: Vec<Upsampler2x>,
+    down: Vec<Decimator2x>,
+    factor: usize,
+    latency: f64,
+}
+
+impl Oversampler {
+    /// `factor` must be 2, 4, 8, or 16 — validated by the caller
+    /// (`EqChain::new`); this constructor panics on anything else.
+    pub fn new(factor: usize, device_rate: f64) -> Self {
+        assert!(
+            matches!(factor, 2 | 4 | 8 | 16),
+            "unsupported oversample factor {factor}"
+        );
+        let stages = factor.trailing_zeros() as usize;
+        let mut up = Vec::with_capacity(stages);
+        let mut down = Vec::with_capacity(stages);
+        let mut latency = 0.0;
+        for s in 0..stages {
+            let fs_in = device_rate * f64::from(1 << s);
+            let taps = halfband_taps(fs_in, 20_000.0, ATTEN_DB);
+            // The up+down pair at this stage delays (len-1) samples at
+            // 2^(s+1)·device_rate, i.e. (len-1)/2^(s+1) device frames.
+            latency += (taps.len() - 1) as f64 / f64::from(1 << (s + 1));
+            up.push(Upsampler2x::new(&taps));
+            down.push(Decimator2x::new(&taps));
+        }
+        Self {
+            up,
+            down,
+            factor,
+            latency,
+        }
+    }
+
+    /// Expand one device-rate sample into `factor` samples at the
+    /// oversampled rate. Returns the count written.
+    #[inline]
+    pub fn up(&mut self, x: f64, out: &mut [f64; MAX_FACTOR]) -> usize {
+        out[0] = x;
+        let mut n = 1;
+        for stage in &mut self.up {
+            // Copy, then expand forward: push() must see inputs in
+            // time order, and writing 2i/2i+1 in place would clobber
+            // unread inputs.
+            let tmp = *out;
+            for (i, &s) in tmp[..n].iter().enumerate() {
+                let [a, b] = stage.push(s);
+                out[2 * i] = a;
+                out[2 * i + 1] = b;
+            }
+            n *= 2;
+        }
+        n
+    }
+
+    /// Collapse the first `factor` slots of `samples` back to one
+    /// device-rate sample. Consumes the buffer in place.
+    #[inline]
+    pub fn down(&mut self, samples: &mut [f64; MAX_FACTOR]) -> f64 {
+        let mut n = self.factor;
+        // Highest-rate stage decimates first.
+        for stage in self.down.iter_mut().rev() {
+            for i in 0..n / 2 {
+                samples[i] = stage.push(samples[2 * i], samples[2 * i + 1]);
+            }
+            n /= 2;
+        }
+        samples[0]
+    }
+
+    /// Total group delay in device-rate frames. Integer at 2×,
+    /// fractional at higher factors.
+    pub fn latency_frames(&self) -> f64 {
+        self.latency
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +382,109 @@ mod tests {
             }
         }
         assert!(peak < 1e-5, "stopband leak {peak}");
+    }
+
+    fn sine64(freq: f64, fs: f64, n: usize) -> Vec<f64> {
+        use std::f64::consts::TAU;
+        (0..n).map(|i| (TAU * freq * i as f64 / fs).sin()).collect()
+    }
+
+    #[test]
+    fn round_trip_2x_is_a_pure_integer_delay() {
+        let fs = 48_000.0;
+        let mut os = Oversampler::new(2, fs);
+        let lat = os.latency_frames();
+        assert_eq!(lat.fract(), 0.0, "2x delay must be integer, got {lat}");
+        let d = lat as usize;
+        let input = sine64(1_000.0, fs, 4 * d + 4_800);
+        let mut buf = [0.0f64; MAX_FACTOR];
+        let out: Vec<f64> = input
+            .iter()
+            .map(|&x| {
+                let n = os.up(x, &mut buf);
+                assert_eq!(n, 2);
+                os.down(&mut buf)
+            })
+            .collect();
+        // -110 dBFS residual bound on a unit sine. Skip the first `d`
+        // outputs: the composite up+down FIR has support 2d+1 wide, so
+        // an output at t+d only draws exclusively on real (already-fed)
+        // input once t >= d; before that it still reaches into the
+        // zero-initialized pre-roll (t < 0), a causal-filter startup
+        // transient inherent to any implementation, not a resampler
+        // defect. Measured residual is already < 3e-6 by t ~ d/2.
+        for t in d..input.len() - d {
+            assert!(
+                (out[t + d] - input[t]).abs() < 3.2e-6,
+                "sample {t}: {} vs {}",
+                out[t + d],
+                input[t]
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_higher_factors_are_rms_transparent() {
+        let fs = 48_000.0;
+        for factor in [4usize, 8, 16] {
+            for freq in [100.0, 1_000.0, 10_000.0, 19_000.0] {
+                let mut os = Oversampler::new(factor, fs);
+                let input = sine64(freq, fs, 24_000);
+                let mut buf = [0.0f64; MAX_FACTOR];
+                let out: Vec<f64> = input
+                    .iter()
+                    .map(|&x| {
+                        os.up(x, &mut buf);
+                        os.down(&mut buf)
+                    })
+                    .collect();
+                let rms =
+                    |s: &[f64]| (s.iter().map(|x| x * x).sum::<f64>() / s.len() as f64).sqrt();
+                let half = input.len() / 2;
+                let db = 20.0 * (rms(&out[half..]) / rms(&input[half..])).log10();
+                assert!(db.abs() < 0.05, "{factor}x @ {freq} Hz: {db} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn impulse_peak_lands_at_reported_latency() {
+        for factor in [2usize, 4, 8, 16] {
+            let mut os = Oversampler::new(factor, 48_000.0);
+            let lat = os.latency_frames();
+            let mut buf = [0.0f64; MAX_FACTOR];
+            let (mut peak_t, mut peak_v) = (0usize, 0.0f64);
+            for t in 0..lat.ceil() as usize + 64 {
+                let x = if t == 0 { 1.0 } else { 0.0 };
+                os.up(x, &mut buf);
+                let y = os.down(&mut buf).abs();
+                if y > peak_v {
+                    (peak_t, peak_v) = (t, y);
+                }
+            }
+            assert!(
+                (peak_t as f64 - lat).abs() <= 0.5,
+                "factor {factor}: peak at {peak_t}, latency {lat}"
+            );
+            // For factor >= 4, `lat` is fractional: the true (continuous)
+            // impulse peak falls *between* two output samples, so the
+            // best any single sample can score is bounded by
+            // sinc(frac) = sin(pi*frac)/(pi*frac), frac = distance to the
+            // nearest integer sample — e.g. exactly half way (factor 4,
+            // frac=0.5) caps it at sin(0.5*pi)/(0.5*pi) ~= 0.637, not 1.0.
+            // Require getting within 10% of that theoretical ceiling
+            // rather than an unconditional 0.9 (only reachable when
+            // frac == 0, i.e. factor 2).
+            let frac = lat.fract().min(1.0 - lat.fract());
+            let ideal_peak = if frac == 0.0 {
+                1.0
+            } else {
+                (PI * frac).sin() / (PI * frac)
+            };
+            assert!(
+                peak_v > 0.9 * ideal_peak,
+                "factor {factor}: peak amplitude {peak_v}, ideal ceiling {ideal_peak}"
+            );
+        }
     }
 }
