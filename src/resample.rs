@@ -117,12 +117,44 @@ impl Upsampler2x {
     pub fn push(&mut self, x: f64) -> [f64; 2] {
         let n = self.buf.len();
         self.buf[self.pos] = x;
+
+        // Newest-first convolution over the ring: the tap index walks
+        // `pos → 0` then `n-1 → pos+1`. The obvious form — a `for &c in
+        // &self.branch` loop indexing `self.buf[idx]` with a manual wrap —
+        // costs more than it looks: the compiler cannot prove `idx < n`
+        // (idx seeds from the opaque `self.pos` field and is only kept in
+        // range by the wrap arithmetic), so it emits a `panic_bounds_check`
+        // on every tap. That check is not just a compare-and-branch; because
+        // it can panic mid-loop it is an optimization barrier that blocks the
+        // backend from unrolling and software-pipelining the otherwise
+        // independent multiplies (the halfband branch is ~48 taps at the
+        // first stage). asm confirmed the panic and the serial, un-unrolled
+        // loop; see `benches/dsp.rs` for the throughput win on the 4x/16x
+        // oversampled paths.
+        //
+        // Splitting the ring at `pos + 1` turns the walk into two contiguous
+        // forward slices consumed back-to-front. Slice iterators carry their
+        // own length, so no per-element bounds check is emitted and the loops
+        // unroll; the per-tap wrap test is gone too. The taps are still
+        // visited in the exact same order as the manual loop, so the f64
+        // accumulation order is unchanged and the output stays bit-identical
+        // (no fast-math reassociation involved — the exactness the resampler
+        // tests assert to 1e-15 is preserved).
+        //
+        // Bounds on the split: `pos < n` is maintained below, so
+        // `pos + 1 <= n` and `split_at` never panics; `branch.len() ==
+        // buf.len()`, so both slices split at the same point and stay
+        // tap-aligned.
+        let (buf_lo, buf_hi) = self.buf.split_at(self.pos + 1);
+        let (br_lo, br_hi) = self.branch.split_at(self.pos + 1);
         let mut acc = 0.0;
-        let mut idx = self.pos;
-        for &c in &self.branch {
-            acc += c * self.buf[idx];
-            idx = if idx == 0 { n - 1 } else { idx - 1 };
+        for (&c, &s) in br_lo.iter().zip(buf_lo.iter().rev()) {
+            acc += c * s;
         }
+        for (&c, &s) in br_hi.iter().zip(buf_hi.iter().rev()) {
+            acc += c * s;
+        }
+
         let delayed = self.buf[(self.pos + n - self.center_delay) % n];
         self.pos = (self.pos + 1) % n;
         [acc, self.center * delayed]
@@ -174,12 +206,27 @@ impl Decimator2x {
         let no = self.odd.len();
         self.even[self.epos] = v0;
         self.odd[self.opos] = v1;
+
+        // Same newest-first ring convolution as `Upsampler2x::push`, over the
+        // even phase — see that method for why the two-contiguous-slice form
+        // is used: the manual `even[idx]` walk emits a per-tap
+        // `panic_bounds_check` the compiler can't elide, and that check is an
+        // optimization barrier that stops the multiply loop from unrolling.
+        // Slice iterators are provably in range, so the check and the wrap
+        // test both disappear and the loop unrolls; tap visitation order is
+        // unchanged, so the output stays bit-identical. `epos < ne` is
+        // maintained below and `branch.len() == even.len()`, so the split is
+        // in range and tap-aligned.
+        let (ev_lo, ev_hi) = self.even.split_at(self.epos + 1);
+        let (br_lo, br_hi) = self.branch.split_at(self.epos + 1);
         let mut acc = 0.0;
-        let mut idx = self.epos;
-        for &c in &self.branch {
-            acc += c * self.even[idx];
-            idx = if idx == 0 { ne - 1 } else { idx - 1 };
+        for (&c, &s) in br_lo.iter().zip(ev_lo.iter().rev()) {
+            acc += c * s;
         }
+        for (&c, &s) in br_hi.iter().zip(ev_hi.iter().rev()) {
+            acc += c * s;
+        }
+
         let delayed = self.odd[(self.opos + no - self.center_delay) % no];
         self.epos = (self.epos + 1) % ne;
         self.opos = (self.opos + 1) % no;
@@ -196,6 +243,10 @@ pub struct Oversampler {
     down: Vec<Decimator2x>,
     factor: usize,
     latency: f64,
+    /// Reused input buffer for `up`: each stage reads its `n` live inputs
+    /// from here before scattering outputs into `out`. Pre-allocated so the
+    /// per-sample copy is `n` slots, not the whole `MAX_FACTOR` array.
+    scratch: [f64; MAX_FACTOR],
 }
 
 impl Oversampler {
@@ -228,6 +279,7 @@ impl Oversampler {
             down,
             factor,
             latency,
+            scratch: [0.0; MAX_FACTOR],
         }
     }
 
@@ -237,12 +289,16 @@ impl Oversampler {
     pub fn up(&mut self, x: f64, out: &mut [f64; MAX_FACTOR]) -> usize {
         out[0] = x;
         let mut n = 1;
+        // Disjoint-field borrow: `scratch` and `up` are separate fields, so
+        // both can be held mutably at once.
+        let scratch = &mut self.scratch;
         for stage in &mut self.up {
-            // Copy, then expand forward: push() must see inputs in
-            // time order, and writing 2i/2i+1 in place would clobber
-            // unread inputs.
-            let tmp = *out;
-            for (i, &s) in tmp[..n].iter().enumerate() {
+            // Copy the `n` live inputs, then expand forward: push() must see
+            // inputs in time order, and writing 2i/2i+1 straight into `out`
+            // would clobber not-yet-read inputs. Only the live prefix is
+            // copied, not the whole MAX_FACTOR array.
+            scratch[..n].copy_from_slice(&out[..n]);
+            for (i, &s) in scratch[..n].iter().enumerate() {
                 let [a, b] = stage.push(s);
                 out[2 * i] = a;
                 out[2 * i + 1] = b;
