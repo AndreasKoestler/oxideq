@@ -144,6 +144,16 @@ the default of 1 no resampler code runs at all and the pipeline stays
 bit-perfect; with N > 1 every sample is rewritten by the resampling filters,
 so bit-perfectness is intentionally traded for response accuracy.
 
+### Filter backend
+
+`--backend <df1|df2>` (default `df1`) selects the biquad realization: Direct
+Form 1 or Direct Form 2 transposed. Both realize the same transfer function;
+they differ only in numerical conditioning. DF2 transposed is generally
+better-conditioned at very high internal sample rates, so it pairs naturally
+with a high `--oversample` factor. The choice is dispatched once per block, so
+it has no per-sample cost. `df1` keeps the historical (and bit-perfect at
+`--oversample 1`) behavior.
+
 ## Roadmap (explicit non-goals for v1)
 
 - Format-shift hot reload (rate changes currently require restart).
