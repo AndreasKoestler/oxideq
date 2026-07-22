@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{BufferSize, Device, SampleFormat, StreamConfig, SupportedBufferSize};
+use cpal::{BufferSize, Device, SampleFormat, Stream, StreamConfig, SupportedBufferSize};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
 
@@ -34,6 +34,7 @@ const PREFILL_BLOCKS: usize = 2;
 /// Upper bound on samples handled per callback chunk (scratch size).
 const MAX_CALLBACK_SAMPLES: usize = 16_384;
 
+#[derive(Default)]
 struct Stats {
     underruns: AtomicU64,
     overruns: AtomicU64,
@@ -48,26 +49,156 @@ pub fn clamp_buffer(requested: u32, supported: &SupportedBufferSize) -> BufferSi
     }
 }
 
+/// Total pipeline latency in milliseconds: the ring buffering (the prefill plus
+/// the two in-flight blocks) added to the EQ cascade's own group delay.
+#[must_use]
+fn pipeline_latency_ms(frames: u32, rate: u32, os_latency_frames: f64) -> f64 {
+    let os_ms = os_latency_frames / f64::from(rate) * 1_000.0;
+    (f64::from(frames) * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0 + os_ms
+}
+
+/// Largest chunk size not exceeding `cap` that is a whole number of frames.
+///
+/// A chunk boundary inside a frame would run one channel's samples through
+/// another channel's filter state, so the cap is rounded down to a frame.
+#[must_use]
+fn frame_aligned_chunk(cap: usize, channels: usize) -> usize {
+    cap - cap % channels
+}
+
+/// Number of samples outside the normalized `[-1.0, 1.0]` range.
+///
+/// `.contains` is clippy-idiomatic and optimizes to the same code as
+/// `x < -1.0 || x > 1.0`; the `±1.0` boundary is in range.
+#[must_use]
+fn count_clipped(samples: &[f32]) -> usize {
+    samples
+        .iter()
+        .filter(|x| !(-1.0..=1.0).contains(*x))
+        .count()
+}
+
+/// Frame count the ring and latency report should assume: the larger of the two
+/// devices' block sizes, falling back to `requested` when a device reports
+/// `Default` (devices may clamp the requested block size).
+#[must_use]
+fn block_frames(in_buf: BufferSize, out_buf: BufferSize, requested: u32) -> u32 {
+    let fixed = |b: BufferSize| match b {
+        BufferSize::Fixed(n) => n,
+        BufferSize::Default => requested,
+    };
+    fixed(in_buf).max(fixed(out_buf))
+}
+
+/// The one-line startup banner printed once both streams are running.
+#[must_use]
+fn startup_line(
+    rate: u32,
+    ch: usize,
+    num_bands: usize,
+    backend: Backend,
+    oversample: usize,
+    frames: u32,
+    latency_ms: f64,
+) -> String {
+    let os_note = if oversample > 1 {
+        format!(", {oversample}x oversampled")
+    } else {
+        String::new()
+    };
+    let backend_note = match backend {
+        Backend::Df1 => String::new(),
+        Backend::Df2 => ", DF2 biquads".to_string(),
+    };
+    format!(
+        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands{backend_note}{os_note}, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
+    )
+}
+
+/// Warning lines for the last reporting window; empty when every counter is
+/// zero.
+#[must_use]
+fn stats_warnings(underruns: u64, overruns: u64, clipped: u64) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if underruns + overruns > 0 {
+        warnings.push(format!(
+            "warning: {underruns} underruns, {overruns} overruns in last 5 s (try a larger --buffer)"
+        ));
+    }
+    if clipped > 0 {
+        warnings.push(format!(
+            "warning: {clipped} samples clipped in last 5 s — preset preamp may be insufficient"
+        ));
+    }
+    warnings
+}
+
 /// Run the capture → EQ → playback engine until the process is killed.
 ///
 /// # Errors
 /// Returns an error if device configs cannot be queried, no common sample
 /// rate can be negotiated, the EQ chain fails to build, or a stream cannot be
 /// built or started.
-// One linear setup routine (config negotiation → ring → callbacks → report);
-// splitting it hurts readability more than it helps, so `too_many_lines` is
-// allowed here specifically.
-#[allow(clippy::too_many_lines)]
 pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig) -> Result<()> {
-    // Name our PipeWire node `oxideq` so pw-link / qpwgraph can find it for
-    // manual routing. (pipewire-alsa reads PIPEWIRE_PROPS; harmless elsewhere.)
+    set_pipewire_node_name();
+
+    let (in_cfg, out_cfg, rate) = negotiated_stream_configs(input, output, cfg)?;
+    let frames = block_frames(in_cfg.buffer_size, out_cfg.buffer_size, cfg.buffer_frames);
+    let ch = cfg.channels as usize;
+
+    let chain = EqChain::with_backend(preset, f64::from(rate), ch, cfg.oversample, cfg.backend)?;
+    let num_bands = chain.num_bands();
+    let os_latency_frames = chain.latency_frames();
+
+    let stats = Arc::new(Stats::default());
+    let (input_stream, output_stream) =
+        build_streams(input, output, in_cfg, out_cfg, chain, &stats, frames)?;
+    start_streams(&input_stream, &output_stream)?;
+
+    let latency_ms = pipeline_latency_ms(frames, rate, os_latency_frames);
+    println!(
+        "{}",
+        startup_line(
+            rate,
+            ch,
+            num_bands,
+            cfg.backend,
+            cfg.oversample,
+            frames,
+            latency_ms
+        )
+    );
+
+    report_loop(&stats)
+}
+
+/// Name our `PipeWire` node `oxideq` so pw-link / qpwgraph can find it for
+/// manual routing. (pipewire-alsa reads `PIPEWIRE_PROPS`; harmless elsewhere.)
+fn set_pipewire_node_name() {
     if cfg!(target_os = "linux") {
-        // SAFETY: this is the first statement in `run()`, executed on the
-        // startup thread before any audio streams or threads are spawned, so no
-        // other thread can be reading the environment concurrently.
+        // SAFETY: `run` calls this as its first statement, on the startup
+        // thread before any audio stream or thread is spawned, so no other
+        // thread can be reading the environment concurrently.
         unsafe { std::env::set_var("PIPEWIRE_PROPS", "{ node.name = oxideq }") };
     }
+}
 
+/// Query both devices, negotiate one shared sample rate, and assemble the
+/// capture and playback [`StreamConfig`]s plus the chosen rate.
+///
+/// A single rate drives the whole pipeline: the ring has no resampler, so
+/// capture and playback must open at the same rate or the ring drifts and the
+/// audio pitch-shifts. Prints the same non-fatal warnings as before when the
+/// input default format is not f32 or the output cannot lock the requested rate.
+///
+/// # Errors
+/// Returns an error if either device config cannot be queried or no common
+/// sample rate can be negotiated.
+fn negotiated_stream_configs(
+    input: &Device,
+    output: &Device,
+    cfg: &EngineConfig,
+) -> Result<(StreamConfig, StreamConfig, u32)> {
     let in_default = input
         .default_input_config()
         .context("querying input config")?;
@@ -80,11 +211,7 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     // Detect the source rate at runtime. (cpal 0.18 `sample_rate()` returns
     // a bare u32 — no `.0` to unwrap.)
     let want = in_default.sample_rate();
-    let ch = cfg.channels as usize;
 
-    // One rate for the whole pipeline: the ring has no resampler, so
-    // capture and playback must open at the same rate or the ring drifts
-    // and the audio pitch-shifts.
     let (rate, exact) = devices::negotiate_rate(input, output, want, cfg.channels)?;
     if !exact {
         eprintln!(
@@ -96,26 +223,35 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     let out_supported = output
         .default_output_config()
         .context("querying output config")?;
-    let in_buf = clamp_buffer(cfg.buffer_frames, in_default.buffer_size());
-    let out_buf = clamp_buffer(cfg.buffer_frames, out_supported.buffer_size());
     let in_cfg = StreamConfig {
         channels: cfg.channels,
         sample_rate: rate,
-        buffer_size: in_buf,
+        buffer_size: clamp_buffer(cfg.buffer_frames, in_default.buffer_size()),
     };
     let out_cfg = StreamConfig {
         channels: cfg.channels,
         sample_rate: rate,
-        buffer_size: out_buf,
+        buffer_size: clamp_buffer(cfg.buffer_frames, out_supported.buffer_size()),
     };
+    Ok((in_cfg, out_cfg, rate))
+}
 
-    // Devices may clamp the requested block size; size the ring and report
-    // latency from what they actually use (`Default` → assume the request).
-    let fixed = |b: &BufferSize| match *b {
-        BufferSize::Fixed(n) => n,
-        BufferSize::Default => cfg.buffer_frames,
-    };
-    let frames = fixed(&in_cfg.buffer_size).max(fixed(&out_cfg.buffer_size));
+/// Create and prime the SPSC ring, then build the capture and playback streams
+/// with their RT-safe callbacks. The callbacks allocate nothing: `scratch` and
+/// the ring are pre-allocated here and moved in.
+///
+/// # Errors
+/// Returns an error if either stream cannot be built for the negotiated config.
+fn build_streams(
+    input: &Device,
+    output: &Device,
+    in_cfg: StreamConfig,
+    out_cfg: StreamConfig,
+    mut chain: EqChain,
+    stats: &Arc<Stats>,
+    frames: u32,
+) -> Result<(Stream, Stream)> {
+    let ch = in_cfg.channels as usize;
     let block = frames as usize * ch;
     let rb = HeapRb::<f32>::new(block * RING_BLOCKS);
     let (mut prod, mut cons) = rb.split();
@@ -124,22 +260,10 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     let silence = vec![0.0f32; block * PREFILL_BLOCKS];
     prod.push_slice(&silence);
 
-    let mut chain =
-        EqChain::with_backend(preset, f64::from(rate), ch, cfg.oversample, cfg.backend)?;
-    let num_bands = chain.num_bands();
-    let os_latency_frames = chain.latency_frames();
-    let stats = Arc::new(Stats {
-        underruns: AtomicU64::new(0),
-        overruns: AtomicU64::new(0),
-        clipped: AtomicU64::new(0),
-    });
-
     // Input callback: preamp + EQ, clip count, push. RT-safe.
-    // Chunk cap rounded down to a whole frame: a chunk boundary inside a
-    // frame would run one channel's samples through another's filter state.
-    let chunk_samples = MAX_CALLBACK_SAMPLES - MAX_CALLBACK_SAMPLES % ch;
+    let chunk_samples = frame_aligned_chunk(MAX_CALLBACK_SAMPLES, ch);
     let mut scratch = vec![0.0f32; MAX_CALLBACK_SAMPLES];
-    let in_stats = Arc::clone(&stats);
+    let in_stats = Arc::clone(stats);
     let input_stream = input
         .build_input_stream(
             in_cfg,
@@ -151,10 +275,9 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
                     let s = &mut scratch[..chunk.len()];
                     s.copy_from_slice(chunk);
                     chain.process(s);
-                    // `.contains` is clippy-idiomatic and optimizes to the
-                    // same code as `x < -1.0 || x > 1.0`. Count locally,
-                    // touch the shared atomic at most once per chunk.
-                    let clipped = s.iter().filter(|x| !(-1.0..=1.0).contains(*x)).count();
+                    // Count locally, touch the shared atomic at most once per
+                    // chunk.
+                    let clipped = count_clipped(s);
                     if clipped > 0 {
                         in_stats
                             .clipped
@@ -171,7 +294,7 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
         .context("building input stream (is the device f32-capable at this rate?)")?;
 
     // Output callback: pop or zero-fill. RT-safe.
-    let out_stats = Arc::clone(&stats);
+    let out_stats = Arc::clone(stats);
     let output_stream = output
         .build_output_stream(
             out_cfg,
@@ -187,37 +310,29 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
         )
         .context("building output stream")?;
 
+    Ok((input_stream, output_stream))
+}
+
+/// Start capture, then playback.
+///
+/// # Errors
+/// Returns an error if either stream fails to start.
+fn start_streams(input_stream: &Stream, output_stream: &Stream) -> Result<()> {
     input_stream.play().context("starting input stream")?;
     output_stream.play().context("starting output stream")?;
+    Ok(())
+}
 
-    let os_ms = os_latency_frames / f64::from(rate) * 1_000.0;
-    let latency_ms =
-        (f64::from(frames) * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0 + os_ms;
-    let os_note = if cfg.oversample > 1 {
-        format!(", {}x oversampled", cfg.oversample)
-    } else {
-        String::new()
-    };
-    let backend_note = match cfg.backend {
-        Backend::Df1 => String::new(),
-        Backend::Df2 => ", DF2 biquads".to_string(),
-    };
-    println!(
-        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands{backend_note}{os_note}, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
-    );
-
+/// Sleep-and-report loop: every 5 s, drain the counters and print any warnings.
+/// Runs until the process is killed.
+fn report_loop(stats: &Stats) -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(5));
-        let u = stats.underruns.swap(0, Ordering::Relaxed);
-        let o = stats.overruns.swap(0, Ordering::Relaxed);
-        let c = stats.clipped.swap(0, Ordering::Relaxed);
-        if u + o > 0 {
-            eprintln!("warning: {u} underruns, {o} overruns in last 5 s (try a larger --buffer)");
-        }
-        if c > 0 {
-            eprintln!(
-                "warning: {c} samples clipped in last 5 s — preset preamp may be insufficient"
-            );
+        let underruns = stats.underruns.swap(0, Ordering::Relaxed);
+        let overruns = stats.overruns.swap(0, Ordering::Relaxed);
+        let clipped = stats.clipped.swap(0, Ordering::Relaxed);
+        for warning in stats_warnings(underruns, overruns, clipped) {
+            eprintln!("{warning}");
         }
     }
 }
@@ -258,5 +373,75 @@ mod tests {
             clamp_buffer(256, &SupportedBufferSize::Unknown),
             cpal::BufferSize::Default
         ));
+    }
+
+    #[test]
+    fn pipeline_latency_matches_hand_computation() {
+        // block latency = 480 * (2 + PREFILL_BLOCKS) / 48_000 * 1000
+        //               = 480 * 4 / 48_000 * 1000 = 40.0 ms; os_ms = 0.
+        let ms = pipeline_latency_ms(480, 48_000, 0.0);
+        assert!((ms - 40.0).abs() < 1e-9, "got {ms}");
+    }
+
+    #[test]
+    fn pipeline_latency_adds_eq_group_delay() {
+        // 4_800 os-latency frames at 48 kHz add exactly 100 ms on top.
+        let base = pipeline_latency_ms(480, 48_000, 0.0);
+        let with_os = pipeline_latency_ms(480, 48_000, 4_800.0);
+        assert!((with_os - base - 100.0).abs() < 1e-9, "got {with_os}");
+    }
+
+    #[test]
+    fn frame_aligned_chunk_rounds_down_to_whole_frames() {
+        assert_eq!(frame_aligned_chunk(16_384, 1), 16_384);
+        assert_eq!(frame_aligned_chunk(16_384, 2), 16_384);
+        // 16_384 % 6 == 4, so it drops down to the nearest 6-multiple.
+        assert_eq!(frame_aligned_chunk(16_384, 6), 16_380);
+        assert_eq!(frame_aligned_chunk(10, 3), 9);
+    }
+
+    #[test]
+    fn count_clipped_counts_out_of_range_both_signs() {
+        assert_eq!(count_clipped(&[]), 0);
+        // ±1.0 is in range (inclusive), so nothing clips here.
+        assert_eq!(count_clipped(&[0.0, 0.5, -0.5, 1.0, -1.0]), 0);
+        assert_eq!(count_clipped(&[1.5, -1.5, 0.0, 2.0]), 3);
+    }
+
+    #[test]
+    fn block_frames_prefers_fixed_and_takes_the_max() {
+        use cpal::BufferSize::{Default, Fixed};
+        assert_eq!(block_frames(Fixed(256), Fixed(512), 128), 512);
+        assert_eq!(block_frames(Fixed(256), Default, 128), 256);
+        assert_eq!(block_frames(Default, Default, 128), 128);
+    }
+
+    #[test]
+    fn startup_line_reflects_backend_and_oversample() {
+        let df1 = startup_line(48_000, 2, 10, Backend::Df1, 1, 480, 40.0);
+        assert_eq!(
+            df1,
+            "oxideq: 48000 Hz, 2 ch, 10 bands, block 480 frames (~40.0 ms pipeline latency)"
+        );
+
+        let df2_os = startup_line(44_100, 2, 8, Backend::Df2, 4, 256, 21.3);
+        assert!(df2_os.contains(", DF2 biquads"));
+        assert!(df2_os.contains(", 4x oversampled"));
+        assert!(df2_os.contains("44100 Hz"));
+    }
+
+    #[test]
+    fn stats_warnings_reports_only_nonzero_categories() {
+        assert!(stats_warnings(0, 0, 0).is_empty());
+
+        let xruns = stats_warnings(3, 2, 0);
+        assert_eq!(xruns.len(), 1);
+        assert!(xruns[0].contains("3 underruns, 2 overruns"));
+
+        let clip = stats_warnings(0, 0, 7);
+        assert_eq!(clip.len(), 1);
+        assert!(clip[0].contains("7 samples clipped"));
+
+        assert_eq!(stats_warnings(1, 1, 1).len(), 2);
     }
 }
