@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+
+# Least privilege by default; the CRAP job widens to pull-requests: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CRAP_THRESHOLD: "20"
+
+jobs:
+  # ---- Blocking gate: formatting + clippy pedantic ----
+  # Pedantic is enabled crate-wide via [lints.clippy] in Cargo.toml, so
+  # `-D warnings` turns any pedantic finding into a failure.
+  clippy:
+    name: fmt + clippy (pedantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA headers (cpal build dep)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (pedantic, deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ---- Blocking gate: test suite ----
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA headers (cpal build dep)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test
+        run: cargo test --all-features
+
+  # ---- Advisory gate: CRAP score (never blocks the PR) ----
+  crap:
+    name: CRAP score (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA headers (cpal build dep)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install cargo-crap4rust
+        run: cargo install cargo-crap4rust --version '^0.6'
+
+      # CRAP weights complexity by test coverage, so generate coverage first.
+      # continue-on-error keeps the whole job non-blocking.
+      - name: Generate coverage
+        continue-on-error: true
+        run: |
+          cargo llvm-cov --no-report --all-features --ignore-run-fail
+          cargo llvm-cov report --json --output-path llvm-cov.json
+
+      - name: Compute CRAP scores
+        continue-on-error: true
+        run: |
+          cargo-crap4rust \
+            --coverage llvm-cov.json \
+            --all-features \
+            --threshold "${CRAP_THRESHOLD}" \
+            --output-format json > crap.json
+
+      - name: Comment CRAP violations on the PR
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          CRAP_JSON: crap.json
+        with:
+          script: |
+            const report = require('./.github/scripts/crap-report.cjs')
+            await report({ github, context, core })
