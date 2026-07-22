@@ -104,6 +104,30 @@ Computed at construction from the actual device rate:
 - Tap generation is infallible for validated inputs. No new error paths in
   the audio callback.
 
+## Addendum (2026-07-22): decouple the cascade from biquad
+
+Post-implementation review feedback (AWK): `EqChain` hard-coded
+`DirectForm1` and its `Stage::Custom` trait arm was never constructed in
+production. Decision — make the filter backend a runtime choice **without**
+per-sample dynamic dispatch:
+
+- Internal `FilterCascade<F: Filter>` holds the monomorphized hot loop
+  (per-sample `F::run`, inlined — identical cost to today for DF1).
+- New `trait BandFilter: Filter { fn from_band(&Band, fs) -> Result<Self> }`;
+  the RBJ `coefficients()` logic moves into the biquad backends'
+  `from_band` impls, out of the cascade.
+- Public `EqChain` becomes an enum over concrete backends
+  (`Df1(FilterCascade<DirectForm1<f64>>)`, `Df2(FilterCascade<DirectForm2Transposed<f64>>)`);
+  `process`/`num_bands`/`latency_frames` forward via a match that runs
+  **once per block**, never per sample. Runtime selection via a `Backend`
+  enum (`#[default] Df1`).
+- `EqChain::new(...)` keeps its 4-arg signature and defaults to `Df1`
+  (bit-perfect and golden fixtures unaffected); `with_backend(...)` adds
+  the explicit fifth argument. CLI flag deferred (capability only).
+- Open set of external filters remains possible later via a
+  `Custom(FilterCascade<Box<dyn Filter>>)` arm — dyn cost isolated to that
+  opt-in variant; DF1/DF2 stay zero-overhead.
+
 ## Testing
 
 ### Example-based
