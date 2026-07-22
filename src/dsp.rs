@@ -1,4 +1,5 @@
-//! Preamp + pluggable filter cascade (v1 backend: Direct Form 1 biquads).
+//! Preamp + pluggable filter cascade (backend is configurable at runtime;
+//! defaults to Direct Form 1 biquads).
 //!
 //! Everything is allocated in construction; `process` is free of
 //! allocation, locks, and I/O and is safe to call from a real-time
@@ -6,7 +7,7 @@
 //! coefficients, and state are f64.
 
 use anyhow::{anyhow, Result};
-use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
+use biquad::{Biquad, Coefficients, DirectForm1, DirectForm2Transposed, ToHertz, Type};
 
 use crate::preset::{Band, FilterKind, Preset};
 use crate::resample::{Oversampler, MAX_FACTOR};
@@ -15,100 +16,68 @@ pub fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
 
-/// One mono filter stage. Implementations hold *per-channel* state —
-/// `EqChain` builds an independent instance per channel.
-///
-/// Samples are f64: the device boundary is f32, but all DSP arithmetic
-/// runs in 64-bit (Design Decision 3).
-///
-/// Real-time contract: `run` is called once per sample from the audio
-/// callback and must not allocate, lock, or perform I/O.
+/// One mono filter stage; holds per-channel state. RT contract: `run` is
+/// called once per sample from the audio callback and must not allocate,
+/// lock, or perform I/O.
 pub trait Filter: Send {
     fn run(&mut self, sample: f64) -> f64;
 }
 
-/// One stage in the cascade. Biquads are stored concretely so the inner
-/// loop inlines them — no vtable call per sample on the v1 path; anything
-/// else plugs in through the boxed `Filter` trait. Boxing happens once at
-/// construction, never in the audio path.
-pub enum Stage {
-    Biquad(DirectForm1<f64>),
-    Custom(Box<dyn Filter>),
+/// A `Filter` that can be built from an APO preset band at a given sample
+/// rate. This is the bound the preset-driven constructor needs; a bare
+/// `Filter` (e.g. a test fixture) need not implement it.
+pub trait BandFilter: Filter + Sized {
+    fn from_band(band: &Band, fs: f64) -> Result<Self>;
 }
 
-impl Stage {
+impl Filter for DirectForm1<f64> {
     #[inline]
     fn run(&mut self, sample: f64) -> f64 {
-        match self {
-            Stage::Biquad(b) => Biquad::run(b, sample),
-            Stage::Custom(f) => f.run(sample),
-        }
+        Biquad::run(self, sample)
+    }
+}
+impl BandFilter for DirectForm1<f64> {
+    fn from_band(band: &Band, fs: f64) -> Result<Self> {
+        Ok(DirectForm1::<f64>::new(coefficients(band, fs)?))
     }
 }
 
-pub struct EqChain {
+impl Filter for DirectForm2Transposed<f64> {
+    #[inline]
+    fn run(&mut self, sample: f64) -> f64 {
+        Biquad::run(self, sample)
+    }
+}
+impl BandFilter for DirectForm2Transposed<f64> {
+    fn from_band(band: &Band, fs: f64) -> Result<Self> {
+        Ok(DirectForm2Transposed::<f64>::new(coefficients(band, fs)?))
+    }
+}
+
+/// Internal monomorphized cascade: one concrete `F` per stage, so the
+/// per-sample loop inlines `F::run` with no vtable call. Public API is
+/// `EqChain`, which wraps one of these per backend.
+///
+/// The type must be `pub` (not `pub(crate)`) purely so it can appear as a
+/// variant field of the `pub enum EqChain` — Rust requires an enum's field
+/// types be at least as visible as the enum, and enum variant fields can't
+/// carry their own visibility modifier. Every constructor and method stays
+/// `pub(crate)`, so it remains unconstructible and uncallable from outside
+/// this crate: nameable, not usable.
+pub struct FilterCascade<F: Filter> {
     preamp: f64, // linear
     channels: usize,
     /// One cascade per channel: `stages[ch][stage]`.
-    stages: Vec<Vec<Stage>>,
+    stages: Vec<Vec<F>>,
     /// One resampler per channel when oversampling; `None` at factor 1
     /// (structural no-op — the process loop is byte-for-byte today's).
     os: Option<Vec<Oversampler>>,
 }
 
-impl EqChain {
-    /// Biquad-backed chain from an APO preset. `oversample` ∈
-    /// {1, 2, 4, 8, 16}: above 1, the cascade runs at
-    /// `oversample × sample_rate_hz` behind halfband resamplers.
-    pub fn new(
-        preset: &Preset,
-        sample_rate_hz: f64,
-        channels: usize,
-        oversample: usize,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            matches!(oversample, 1 | 2 | 4 | 8 | 16),
-            "oversample factor must be 1, 2, 4, 8, or 16 (got {oversample})"
-        );
-        // Coefficient design at N·fs would accept fc up to N·fs/2 —
-        // enforce the *device* Nyquist limit explicitly.
-        if let Some(b) = preset
-            .bands
-            .iter()
-            .find(|b| b.fc_hz >= sample_rate_hz / 2.0)
-        {
-            return Err(anyhow!(
-                "band Fc {} Hz is at or above device Nyquist ({} Hz)",
-                b.fc_hz,
-                sample_rate_hz / 2.0
-            ));
-        }
-        let internal_rate = sample_rate_hz * oversample as f64;
-        let stages = (0..channels)
-            .map(|_| {
-                preset
-                    .bands
-                    .iter()
-                    .map(|b| {
-                        let c = coefficients(b, internal_rate)?;
-                        Ok(Stage::Biquad(DirectForm1::<f64>::new(c)))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let os = (oversample > 1).then(|| {
-            (0..channels)
-                .map(|_| Oversampler::new(oversample, sample_rate_hz))
-                .collect()
-        });
-        let mut chain = Self::from_stages(preset.preamp_db, stages);
-        chain.os = os;
-        Ok(chain)
-    }
-
+impl<F: Filter> FilterCascade<F> {
     /// Chain over arbitrary stages: `stages[ch][stage]`. The outer length
     /// is the channel count; every channel owns its own stage instances.
-    pub fn from_stages(preamp_db: f64, stages: Vec<Vec<Stage>>) -> Self {
+    pub(crate) fn from_stages(preamp_db: f64, stages: Vec<Vec<F>>) -> Self {
         Self {
             preamp: db_to_linear(preamp_db),
             channels: stages.len(),
@@ -121,7 +90,7 @@ impl EqChain {
     /// multiple of the channel count). Zero-copy: each sample is widened
     /// to f64 in a register, run through preamp + cascade, and written
     /// back where it lay. Real-time safe: no allocation, locks, or I/O.
-    pub fn process(&mut self, interleaved: &mut [f32]) {
+    pub(crate) fn process(&mut self, interleaved: &mut [f32]) {
         debug_assert_eq!(interleaved.len() % self.channels, 0);
         match &mut self.os {
             None => {
@@ -157,17 +126,151 @@ impl EqChain {
         }
     }
 
-    pub fn num_bands(&self) -> usize {
+    pub(crate) fn num_bands(&self) -> usize {
         self.stages.first().map_or(0, Vec::len)
     }
 
     /// Resampler group delay in device-rate frames (0.0 when
     /// oversampling is off).
-    pub fn latency_frames(&self) -> f64 {
+    pub(crate) fn latency_frames(&self) -> f64 {
         self.os
             .as_ref()
             .and_then(|v| v.first())
             .map_or(0.0, Oversampler::latency_frames)
+    }
+}
+
+impl<F: BandFilter> FilterCascade<F> {
+    /// Preset-driven build: validates factor + device Nyquist, designs each
+    /// band's filter at the internal (oversampled) rate, wires resamplers.
+    pub(crate) fn build(
+        preset: &Preset,
+        sample_rate_hz: f64,
+        channels: usize,
+        oversample: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            matches!(oversample, 1 | 2 | 4 | 8 | 16),
+            "oversample factor must be 1, 2, 4, 8, or 16 (got {oversample})"
+        );
+        // Coefficient design at N·fs would accept fc up to N·fs/2 —
+        // enforce the *device* Nyquist limit explicitly.
+        if let Some(b) = preset
+            .bands
+            .iter()
+            .find(|b| b.fc_hz >= sample_rate_hz / 2.0)
+        {
+            return Err(anyhow!(
+                "band Fc {} Hz is at or above device Nyquist ({} Hz)",
+                b.fc_hz,
+                sample_rate_hz / 2.0
+            ));
+        }
+        let internal_rate = sample_rate_hz * oversample as f64;
+        let stages = (0..channels)
+            .map(|_| {
+                preset
+                    .bands
+                    .iter()
+                    .map(|b| F::from_band(b, internal_rate))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let os = (oversample > 1).then(|| {
+            (0..channels)
+                .map(|_| Oversampler::new(oversample, sample_rate_hz))
+                .collect()
+        });
+        let mut chain = Self::from_stages(preset.preamp_db, stages);
+        chain.os = os;
+        Ok(chain)
+    }
+}
+
+/// Which concrete filter backend the cascade runs. Runtime-selectable;
+/// dispatch happens once per processed block, never per sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Direct Form 1 biquad (default; matches historical behavior).
+    #[default]
+    Df1,
+    /// Direct Form 2 transposed biquad.
+    Df2,
+}
+
+/// Preamp + configurable filter cascade. The backend is chosen at
+/// construction; `process` dispatches to the monomorphized inner cascade
+/// once per block.
+pub enum EqChain {
+    Df1(FilterCascade<DirectForm1<f64>>),
+    Df2(FilterCascade<DirectForm2Transposed<f64>>),
+}
+
+impl EqChain {
+    /// Preset-driven chain with the default backend (`Df1`). `oversample`
+    /// ∈ {1,2,4,8,16}: above 1 the cascade runs at `oversample × sample_rate_hz`
+    /// behind halfband resamplers.
+    pub fn new(
+        preset: &Preset,
+        sample_rate_hz: f64,
+        channels: usize,
+        oversample: usize,
+    ) -> Result<Self> {
+        Self::with_backend(
+            preset,
+            sample_rate_hz,
+            channels,
+            oversample,
+            Backend::default(),
+        )
+    }
+
+    /// As `new`, with an explicit filter backend.
+    pub fn with_backend(
+        preset: &Preset,
+        sample_rate_hz: f64,
+        channels: usize,
+        oversample: usize,
+        backend: Backend,
+    ) -> Result<Self> {
+        Ok(match backend {
+            Backend::Df1 => EqChain::Df1(FilterCascade::build(
+                preset,
+                sample_rate_hz,
+                channels,
+                oversample,
+            )?),
+            Backend::Df2 => EqChain::Df2(FilterCascade::build(
+                preset,
+                sample_rate_hz,
+                channels,
+                oversample,
+            )?),
+        })
+    }
+
+    /// Process an interleaved f32 buffer in place. Real-time safe: no
+    /// allocation, locks, or I/O; dispatches to the backend once per call.
+    pub fn process(&mut self, interleaved: &mut [f32]) {
+        match self {
+            EqChain::Df1(c) => c.process(interleaved),
+            EqChain::Df2(c) => c.process(interleaved),
+        }
+    }
+
+    pub fn num_bands(&self) -> usize {
+        match self {
+            EqChain::Df1(c) => c.num_bands(),
+            EqChain::Df2(c) => c.num_bands(),
+        }
+    }
+
+    /// Resampler group delay in device-rate frames (0.0 when oversampling is off).
+    pub fn latency_frames(&self) -> f64 {
+        match self {
+            EqChain::Df1(c) => c.latency_frames(),
+            EqChain::Df2(c) => c.latency_frames(),
+        }
     }
 }
 
@@ -326,14 +429,33 @@ mod tests {
 
     #[test]
     fn custom_filters_plug_in_via_the_trait() {
-        let stages: Vec<Vec<Stage>> = vec![
-            vec![Stage::Custom(Box::new(Inverter))],
-            vec![Stage::Custom(Box::new(Inverter))],
-        ];
-        let mut chain = EqChain::from_stages(0.0, stages);
+        let stages: Vec<Vec<Inverter>> = vec![vec![Inverter], vec![Inverter]];
+        let mut chain = FilterCascade::from_stages(0.0, stages);
         let mut buf = [0.25f32, -0.5, 1.0, 0.0];
         chain.process(&mut buf);
         assert_eq!(buf, [-0.25, 0.5, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn backend_default_is_df1() {
+        let chain = EqChain::new(&Preset::default(), 48_000.0, 2, 1).unwrap();
+        assert!(matches!(chain, EqChain::Df1(_)));
+    }
+
+    #[test]
+    fn df2_backend_applies_the_same_eq() {
+        let p = one_band(FilterKind::Peaking, 1_000.0, 6.0, 1.0);
+        let mut chain = EqChain::with_backend(&p, 48_000.0, 1, 1, Backend::Df2).unwrap();
+        let input = sine(1_000.0, 48_000.0, 1.0);
+        let mut out = input.clone();
+        chain.process(&mut out);
+        let half = input.len() / 2;
+        let g = 20.0 * (rms(&out[half..]) / rms(&input[half..])).log10();
+        assert!(
+            (g - 6.0).abs() < 0.3,
+            "DF2 peaking gain {g} dB should be ~6 dB"
+        );
+        assert!(matches!(chain, EqChain::Df2(_)));
     }
 
     #[test]
