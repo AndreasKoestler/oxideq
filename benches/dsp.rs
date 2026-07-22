@@ -18,7 +18,7 @@ fn bench_process(c: &mut Criterion) {
         10,
         "bench expects the 10-band fixture"
     );
-    let mut chain = EqChain::new(&parsed.preset, 48_000.0, CHANNELS).unwrap();
+    let mut chain = EqChain::new(&parsed.preset, 48_000.0, CHANNELS, 1).unwrap();
     // Non-silent, non-constant input so denormal handling costs are visible.
     let mut buf: Vec<f32> = (0..FRAMES * CHANNELS)
         .map(|i| ((i % 97) as f32 / 97.0) - 0.5)

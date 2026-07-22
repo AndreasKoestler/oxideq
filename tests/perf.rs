@@ -15,7 +15,7 @@ fn dsp_meets_cpu_and_latency_budget() {
     const AUDIO_SECS: usize = 10;
 
     let parsed = preset::parse(include_str!("../presets/example.txt")).unwrap();
-    let mut chain = EqChain::new(&parsed.preset, RATE as f64, CHANNELS).unwrap();
+    let mut chain = EqChain::new(&parsed.preset, RATE as f64, CHANNELS, 1).unwrap();
     let mut buf: Vec<f32> = (0..FRAMES * CHANNELS)
         .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
         .collect();

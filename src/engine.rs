@@ -106,7 +106,7 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     let silence = vec![0.0f32; block * PREFILL_BLOCKS];
     prod.push_slice(&silence);
 
-    let mut chain = EqChain::new(preset, f64::from(rate), ch)?;
+    let mut chain = EqChain::new(preset, f64::from(rate), ch, 1)?;
     let num_bands = chain.num_bands();
     let stats = Arc::new(Stats {
         underruns: AtomicU64::new(0),
