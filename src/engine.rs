@@ -21,6 +21,8 @@ use crate::preset::Preset;
 pub struct EngineConfig {
     pub buffer_frames: u32,
     pub channels: u16,
+    /// EQ-cascade oversampling factor (1 = off).
+    pub oversample: usize,
 }
 
 /// Ring capacity in blocks of `buffer_frames` frames.
@@ -106,8 +108,9 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     let silence = vec![0.0f32; block * PREFILL_BLOCKS];
     prod.push_slice(&silence);
 
-    let mut chain = EqChain::new(preset, f64::from(rate), ch, 1)?;
+    let mut chain = EqChain::new(preset, f64::from(rate), ch, cfg.oversample)?;
     let num_bands = chain.num_bands();
+    let os_latency_frames = chain.latency_frames();
     let stats = Arc::new(Stats {
         underruns: AtomicU64::new(0),
         overruns: AtomicU64::new(0),
@@ -170,9 +173,16 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     input_stream.play().context("starting input stream")?;
     output_stream.play().context("starting output stream")?;
 
-    let latency_ms = (frames as f64 * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0;
+    let os_ms = os_latency_frames / f64::from(rate) * 1_000.0;
+    let latency_ms =
+        (frames as f64 * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0 + os_ms;
+    let os_note = if cfg.oversample > 1 {
+        format!(", {}x oversampled", cfg.oversample)
+    } else {
+        String::new()
+    };
     println!(
-        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
+        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands{os_note}, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
     );
 
     loop {

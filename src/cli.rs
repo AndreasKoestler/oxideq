@@ -32,6 +32,17 @@ pub struct RunArgs {
     /// Requested block size in frames
     #[arg(long = "buffer", value_name = "FRAMES", default_value_t = 256)]
     pub buffer_frames: u32,
+    /// Oversample the EQ cascade by this factor (1 = off, bit-perfect)
+    #[arg(long, default_value_t = 1, value_parser = parse_oversample)]
+    pub oversample: usize,
+}
+
+fn parse_oversample(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n @ (1 | 2 | 4 | 8 | 16)) => Ok(n),
+        Ok(n) => Err(format!("must be 1, 2, 4, 8, or 16 (got {n})")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -82,5 +93,32 @@ mod tests {
     fn unknown_flag_is_an_error() {
         assert!(parse(&["run", "--preset", "p.txt", "--frob"]).is_err());
         assert!(parse(&["frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn oversample_accepts_powers_of_two_and_defaults_to_one() {
+        for n in [1usize, 2, 4, 8, 16] {
+            let Cmd::Run(a) = parse(&["run", "--preset", "p.txt", "--oversample", &n.to_string()])
+                .unwrap()
+                .cmd
+            else {
+                panic!("expected Run")
+            };
+            assert_eq!(a.oversample, n);
+        }
+        let Cmd::Run(a) = parse(&["run", "--preset", "p.txt"]).unwrap().cmd else {
+            panic!("expected Run")
+        };
+        assert_eq!(a.oversample, 1);
+    }
+
+    #[test]
+    fn oversample_rejects_everything_else() {
+        for bad in ["0", "3", "5", "32", "-2", "two"] {
+            assert!(
+                parse(&["run", "--preset", "p.txt", "--oversample", bad]).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 }
