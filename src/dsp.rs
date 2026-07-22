@@ -103,36 +103,55 @@ impl<F: Filter> FilterCascade<F> {
     /// back to one output sample — still fully in place, no heap.
     pub(crate) fn process(&mut self, interleaved: &mut [f32]) {
         debug_assert_eq!(interleaved.len() % self.channels, 0);
-        match &mut self.os {
-            None => {
-                for frame in interleaved.chunks_exact_mut(self.channels) {
-                    for (sample, cascade) in frame.iter_mut().zip(self.stages.iter_mut()) {
-                        let mut x = f64::from(*sample) * self.preamp;
-                        for f in cascade.iter_mut() {
-                            x = f.run(x);
-                        }
-                        *sample = x as f32; // intentional narrowing back to device format
-                    }
-                }
+        if self.os.is_some() {
+            self.process_oversampled(interleaved);
+        } else {
+            self.process_direct(interleaved);
+        }
+    }
+
+    /// Run one f64 sample through a single channel's cascade of stages,
+    /// returning the filtered value. Shared by both process paths.
+    #[inline]
+    fn run_cascade(cascade: &mut [F], mut x: f64) -> f64 {
+        for f in cascade.iter_mut() {
+            x = f.run(x);
+        }
+        x
+    }
+
+    /// Direct (no-oversampling) path: widen each sample to f64, run preamp +
+    /// cascade, write it back in place.
+    fn process_direct(&mut self, interleaved: &mut [f32]) {
+        for frame in interleaved.chunks_exact_mut(self.channels) {
+            for (sample, cascade) in frame.iter_mut().zip(self.stages.iter_mut()) {
+                let x = f64::from(*sample) * self.preamp;
+                *sample = Self::run_cascade(cascade, x) as f32; // intentional narrowing back to device format
             }
-            Some(os) => {
-                let mut buf = [0.0f64; MAX_FACTOR];
-                for frame in interleaved.chunks_exact_mut(self.channels) {
-                    for ((sample, cascade), rs) in frame
-                        .iter_mut()
-                        .zip(self.stages.iter_mut())
-                        .zip(os.iter_mut())
-                    {
-                        let x = f64::from(*sample) * self.preamp;
-                        let n = rs.up(x, &mut buf);
-                        for s in &mut buf[..n] {
-                            for f in cascade.iter_mut() {
-                                *s = f.run(*s);
-                            }
-                        }
-                        *sample = rs.down(&mut buf) as f32;
-                    }
+        }
+    }
+
+    /// Oversampled path: upsample each sample to `factor` samples on a stack
+    /// buffer, run the cascade at the elevated rate, downsample back in place.
+    fn process_oversampled(&mut self, interleaved: &mut [f32]) {
+        // Split borrow of distinct fields keeps the RT path allocation-free:
+        // `os` and `stages` are disjoint, so the borrow checker lets us hold
+        // both mutably at once (no Vec/Box/`mem::take`).
+        let Some(os) = self.os.as_mut() else {
+            return;
+        };
+        let stages = &mut self.stages;
+        let mut buf = [0.0f64; MAX_FACTOR];
+        for frame in interleaved.chunks_exact_mut(self.channels) {
+            for ((sample, cascade), rs) in
+                frame.iter_mut().zip(stages.iter_mut()).zip(os.iter_mut())
+            {
+                let x = f64::from(*sample) * self.preamp;
+                let n = rs.up(x, &mut buf);
+                for s in &mut buf[..n] {
+                    *s = Self::run_cascade(cascade, *s);
                 }
+                *sample = rs.down(&mut buf) as f32;
             }
         }
     }
