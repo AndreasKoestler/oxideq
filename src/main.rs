@@ -31,6 +31,7 @@ fn run(a: cli::RunArgs) -> Result<()> {
             buffer_frames: a.buffer_frames,
             channels: 2,
             oversample: a.oversample,
+            backend: a.backend,
         },
     )
 }

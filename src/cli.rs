@@ -3,6 +3,8 @@
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::dsp::Backend;
+
 #[derive(Debug, Parser)]
 #[command(name = "oxideq", version, about = "Bit-perfect parametric EQ pipeline")]
 pub struct Cli {
@@ -35,6 +37,9 @@ pub struct RunArgs {
     /// Oversample the EQ cascade by this factor (1 = off, bit-perfect)
     #[arg(long, default_value_t = 1, value_parser = parse_oversample)]
     pub oversample: usize,
+    /// Biquad backend: df1 (Direct Form 1, default) or df2 (Direct Form 2 transposed)
+    #[arg(long, default_value = "df1", value_parser = parse_backend)]
+    pub backend: Backend,
 }
 
 fn parse_oversample(s: &str) -> Result<usize, String> {
@@ -42,6 +47,14 @@ fn parse_oversample(s: &str) -> Result<usize, String> {
         Ok(n @ (1 | 2 | 4 | 8 | 16)) => Ok(n),
         Ok(n) => Err(format!("must be 1, 2, 4, 8, or 16 (got {n})")),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+fn parse_backend(s: &str) -> Result<Backend, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "df1" => Ok(Backend::Df1),
+        "df2" => Ok(Backend::Df2),
+        other => Err(format!("must be df1 or df2 (got {other:?})")),
     }
 }
 
@@ -118,6 +131,37 @@ mod tests {
             assert!(
                 parse(&["run", "--preset", "p.txt", "--oversample", bad]).is_err(),
                 "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_accepts_df1_df2_and_defaults_to_df1() {
+        for (arg, want) in [
+            ("df1", Backend::Df1),
+            ("df2", Backend::Df2),
+            ("DF2", Backend::Df2), // case-insensitive
+        ] {
+            let Cmd::Run(a) = parse(&["run", "--preset", "p.txt", "--backend", arg])
+                .unwrap()
+                .cmd
+            else {
+                panic!("expected Run")
+            };
+            assert_eq!(a.backend, want, "--backend {arg}");
+        }
+        let Cmd::Run(a) = parse(&["run", "--preset", "p.txt"]).unwrap().cmd else {
+            panic!("expected Run")
+        };
+        assert_eq!(a.backend, Backend::Df1, "default backend");
+    }
+
+    #[test]
+    fn backend_rejects_unknown() {
+        for bad in ["df3", "direct", "", "1"] {
+            assert!(
+                parse(&["run", "--preset", "p.txt", "--backend", bad]).is_err(),
+                "{bad:?} must be rejected"
             );
         }
     }

@@ -15,7 +15,7 @@ use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
 
 use crate::devices;
-use crate::dsp::EqChain;
+use crate::dsp::{Backend, EqChain};
 use crate::preset::Preset;
 
 pub struct EngineConfig {
@@ -23,6 +23,8 @@ pub struct EngineConfig {
     pub channels: u16,
     /// EQ-cascade oversampling factor (1 = off).
     pub oversample: usize,
+    /// Biquad backend for the cascade.
+    pub backend: Backend,
 }
 
 /// Ring capacity in blocks of `buffer_frames` frames.
@@ -108,7 +110,8 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     let silence = vec![0.0f32; block * PREFILL_BLOCKS];
     prod.push_slice(&silence);
 
-    let mut chain = EqChain::new(preset, f64::from(rate), ch, cfg.oversample)?;
+    let mut chain =
+        EqChain::with_backend(preset, f64::from(rate), ch, cfg.oversample, cfg.backend)?;
     let num_bands = chain.num_bands();
     let os_latency_frames = chain.latency_frames();
     let stats = Arc::new(Stats {
@@ -181,8 +184,12 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     } else {
         String::new()
     };
+    let backend_note = match cfg.backend {
+        Backend::Df1 => String::new(),
+        Backend::Df2 => ", DF2 biquads".to_string(),
+    };
     println!(
-        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands{os_note}, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
+        "oxideq: {rate} Hz, {ch} ch, {num_bands} bands{backend_note}{os_note}, block {frames} frames (~{latency_ms:.1} ms pipeline latency)"
     );
 
     loop {
