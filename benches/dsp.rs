@@ -18,17 +18,19 @@ fn bench_process(c: &mut Criterion) {
         10,
         "bench expects the 10-band fixture"
     );
-    let mut chain = EqChain::new(&parsed.preset, 48_000.0, CHANNELS, 1).unwrap();
-    // Non-silent, non-constant input so denormal handling costs are visible.
-    let mut buf: Vec<f32> = (0..FRAMES * CHANNELS)
-        .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
-        .collect();
 
     let mut g = c.benchmark_group("dsp");
     g.throughput(Throughput::Elements(FRAMES as u64));
-    g.bench_function("process_256frame_stereo_10band", |b| {
-        b.iter(|| chain.process(black_box(&mut buf)));
-    });
+    for factor in [1usize, 4, 16] {
+        let mut chain = EqChain::new(&parsed.preset, 48_000.0, CHANNELS, factor).unwrap();
+        // Non-silent, non-constant input so denormal handling costs are visible.
+        let mut buf: Vec<f32> = (0..FRAMES * CHANNELS)
+            .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
+            .collect();
+        g.bench_function(format!("process_256frame_stereo_10band_{factor}x"), |b| {
+            b.iter(|| chain.process(black_box(&mut buf)));
+        });
+    }
     g.finish();
 }
 

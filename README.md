@@ -126,6 +126,18 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
 Always listen with `--release` builds — debug builds miss real-time
 deadlines and crackle.
 
+### Oversampling
+
+`--oversample <N>` (N ∈ {1, 2, 4, 8, 16}, default 1) runs the EQ cascade at
+N× the device rate behind linear-phase halfband resamplers (Kaiser-windowed
+sinc, ~120 dB stopband). This removes the biquad frequency-response
+"cramping" near Nyquist — audible as slightly pinched high-frequency EQ
+shapes at 44.1/48 kHz. Costs: ~N× DSP CPU and ~1 ms of extra latency
+(reported at startup). With the default of 1 no resampler code runs at all
+and the pipeline stays bit-perfect; with N > 1 every sample is rewritten by
+the resampling filters, so bit-perfectness is intentionally traded for
+response accuracy.
+
 ## Roadmap (explicit non-goals for v1)
 
 - Format-shift hot reload (rate changes currently require restart).
