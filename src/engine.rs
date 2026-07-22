@@ -61,15 +61,27 @@ fn pipeline_latency_ms(frames: u32, rate: u32, os_latency_frames: f64) -> f64 {
 ///
 /// A chunk boundary inside a frame would run one channel's samples through
 /// another channel's filter state, so the cap is rounded down to a frame.
+///
+/// # Panics
+/// Panics if a single frame doesn't fit in `cap` (`channels > cap`): the
+/// rounded-down result would be 0, and `slice::chunks(0)` would panic later
+/// inside the RT callback — fail here at stream-build time instead, with a
+/// message that names the actual problem.
 #[must_use]
 fn frame_aligned_chunk(cap: usize, channels: usize) -> usize {
+    assert!(
+        channels <= cap,
+        "channel count {channels} exceeds callback scratch capacity {cap}"
+    );
     cap - cap % channels
 }
 
 /// Number of samples outside the normalized `[-1.0, 1.0]` range.
 ///
 /// `.contains` is clippy-idiomatic and optimizes to the same code as
-/// `x < -1.0 || x > 1.0`; the `±1.0` boundary is in range.
+/// `x < -1.0 || x > 1.0`; the `±1.0` boundary is in range. NaN fails the
+/// range test and therefore counts as clipped — intentional: a non-finite
+/// sample is faulty output worth warning about.
 #[must_use]
 fn count_clipped(samples: &[f32]) -> usize {
     samples
@@ -401,11 +413,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "exceeds callback scratch capacity")]
+    fn frame_aligned_chunk_rejects_channels_larger_than_cap() {
+        let _ = frame_aligned_chunk(8, 9);
+    }
+
+    #[test]
     fn count_clipped_counts_out_of_range_both_signs() {
         assert_eq!(count_clipped(&[]), 0);
         // ±1.0 is in range (inclusive), so nothing clips here.
         assert_eq!(count_clipped(&[0.0, 0.5, -0.5, 1.0, -1.0]), 0);
         assert_eq!(count_clipped(&[1.5, -1.5, 0.0, 2.0]), 3);
+        // Non-finite samples are faulty output: NaN counts as clipped.
+        assert_eq!(count_clipped(&[f32::NAN, 0.0]), 1);
     }
 
     #[test]
