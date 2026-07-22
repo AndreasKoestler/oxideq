@@ -1,6 +1,10 @@
 //! DSP throughput bench. Interpretation:
 //! a 256-frame stereo block at 48 kHz is 5.333 ms of audio, so the
 //! <1%-of-one-core NFR requires < 53.3 us per iteration here.
+//!
+//! That <1%-of-core / <53.3 us budget applies only to the `1x`
+//! (no-oversampling) line below; the `4x`/`16x` lines are informational —
+//! oversampling is opt-in and not covered by the bit-perfect-path NFR.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;

@@ -108,6 +108,9 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
   only the device boundary is f32 (the PipeWire/CoreAudio native format).
 - A flat preset (0 dB preamp, no bands) is bit-identical passthrough
   (covered by a unit test).
+- `--oversample` with N > 1 is intentionally not bit-perfect — every sample
+  is rewritten by the resampling filters; the default (N=1) keeps the
+  bit-perfect guarantee.
 
 ## Performance validation (NFRs)
 
@@ -132,11 +135,14 @@ deadlines and crackle.
 N× the device rate behind linear-phase halfband resamplers (Kaiser-windowed
 sinc, ~120 dB stopband). This removes the biquad frequency-response
 "cramping" near Nyquist — audible as slightly pinched high-frequency EQ
-shapes at 44.1/48 kHz. Costs: ~N× DSP CPU and ~1 ms of extra latency
-(reported at startup). With the default of 1 no resampler code runs at all
-and the pipeline stays bit-perfect; with N > 1 every sample is rewritten by
-the resampling filters, so bit-perfectness is intentionally traded for
-response accuracy.
+shapes at 44.1/48 kHz. Costs: the halfband FIR resamplers dominate CPU, so
+the real cost is well above a naïve N× — measured ≈16× the 1× cost at 4× and
+≈42× at 16× (`cargo bench --bench dsp`), though still a small fraction of one
+core (≈1.5% at 4×, ≈4% at 16× for a 256-frame stereo block), and adds ~1 ms
+of latency, included in the pipeline-latency figure printed at startup. With
+the default of 1 no resampler code runs at all and the pipeline stays
+bit-perfect; with N > 1 every sample is rewritten by the resampling filters,
+so bit-perfectness is intentionally traded for response accuracy.
 
 ## Roadmap (explicit non-goals for v1)
 
