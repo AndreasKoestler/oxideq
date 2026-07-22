@@ -64,6 +64,7 @@ impl BandFilter for DirectForm2Transposed<f64> {
 /// carry their own visibility modifier. Every constructor and method stays
 /// `pub(crate)`, so it remains unconstructible and uncallable from outside
 /// this crate: nameable, not usable.
+#[derive(Debug)]
 pub struct FilterCascade<F: Filter> {
     preamp: f64, // linear
     channels: usize,
@@ -87,9 +88,14 @@ impl<F: Filter> FilterCascade<F> {
     }
 
     /// Process an interleaved f32 buffer in place (`len` must be a
-    /// multiple of the channel count). Zero-copy: each sample is widened
-    /// to f64 in a register, run through preamp + cascade, and written
-    /// back where it lay. Real-time safe: no allocation, locks, or I/O.
+    /// multiple of the channel count). Real-time safe: no allocation,
+    /// locks, or I/O.
+    ///
+    /// Without oversampling (`os` is `None`) each sample is widened to f64,
+    /// run through preamp + cascade, and written back where it lay. With
+    /// oversampling each sample is upsampled to `factor` samples on a stack
+    /// buffer, run through the cascade at the elevated rate, and downsampled
+    /// back to one output sample — still fully in place, no heap.
     pub(crate) fn process(&mut self, interleaved: &mut [f32]) {
         debug_assert_eq!(interleaved.len() % self.channels, 0);
         match &mut self.os {
@@ -201,6 +207,7 @@ pub enum Backend {
 /// Preamp + configurable filter cascade. The backend is chosen at
 /// construction; `process` dispatches to the monomorphized inner cascade
 /// once per block.
+#[derive(Debug)]
 pub enum EqChain {
     Df1(FilterCascade<DirectForm1<f64>>),
     Df2(FilterCascade<DirectForm2Transposed<f64>>),

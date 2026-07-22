@@ -17,16 +17,21 @@ pub const MAX_FACTOR: usize = 16;
 fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0;
     let mut term = 1.0;
-    let mut k = 1.0;
-    loop {
-        let f = x / (2.0 * k);
+    // Bounded: a non-finite `x` would make the convergence test
+    // `term < sum * 1e-18` never fire (comparisons against NaN are always
+    // false), so an unbounded loop could hang. The series converges in far
+    // fewer than 100 terms for the β ≤ ~13 used here, so real inputs still
+    // return at exactly the same term — the cap only turns a would-be hang
+    // on garbage input into a (garbage) return.
+    for k in 1..=100u32 {
+        let f = x / (2.0 * f64::from(k));
         term *= f * f;
         sum += term;
         if term < sum * 1e-18 {
-            return sum;
+            break;
         }
-        k += 1.0;
     }
+    sum
 }
 
 /// Kaiser-windowed-sinc halfband lowpass for a 2× stage whose *input*
@@ -74,6 +79,7 @@ pub fn halfband_taps(fs_in: f64, passband_hz: f64, atten_db: f64) -> Vec<f64> {
 /// Polyphase 2× interpolator. Feed one sample at fs_in, get two at
 /// 2·fs_in. Even output phase is the sinc branch; odd phase is the
 /// (scaled) center-tap delay.
+#[derive(Debug)]
 pub struct Upsampler2x {
     /// Even-index taps of the ×2-scaled prototype (the non-zero branch).
     branch: Vec<f64>,
@@ -88,6 +94,11 @@ pub struct Upsampler2x {
 
 impl Upsampler2x {
     pub fn new(taps: &[f64]) -> Self {
+        debug_assert!(
+            taps.len() % 4 == 3,
+            "halfband taps must have length 4k+3 (got {})",
+            taps.len()
+        );
         let m = (taps.len() - 1) / 2;
         let branch: Vec<f64> = taps.iter().step_by(2).map(|&t| 2.0 * t).collect();
         Self {
@@ -117,6 +128,7 @@ impl Upsampler2x {
 }
 
 /// Polyphase 2× decimator over the same (unscaled) halfband prototype.
+#[derive(Debug)]
 pub struct Decimator2x {
     /// Even-index taps (the non-zero branch).
     branch: Vec<f64>,
@@ -132,6 +144,11 @@ pub struct Decimator2x {
 
 impl Decimator2x {
     pub fn new(taps: &[f64]) -> Self {
+        debug_assert!(
+            taps.len() % 4 == 3,
+            "halfband taps must have length 4k+3 (got {})",
+            taps.len()
+        );
         let m = (taps.len() - 1) / 2;
         let branch: Vec<f64> = taps.iter().step_by(2).copied().collect();
         let center_delay = (m - 1) / 2 + 1;
@@ -170,6 +187,7 @@ impl Decimator2x {
 /// Cascaded halfband stages for oversampling by 2^k, k in 1..=4.
 /// Stage `s` (0-based) resamples between `device_rate·2^s` and
 /// `device_rate·2^(s+1)`.
+#[derive(Debug)]
 pub struct Oversampler {
     up: Vec<Upsampler2x>,
     down: Vec<Decimator2x>,
