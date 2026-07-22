@@ -4,15 +4,15 @@
 //! They communicate only through a pre-allocated SPSC ring buffer and
 //! relaxed atomics. The main thread sleeps and reports stats.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{BufferSize, Device, SampleFormat, StreamConfig, SupportedBufferSize};
-use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
+use ringbuf::traits::{Consumer, Producer, Split};
 
 use crate::devices;
 use crate::dsp::{Backend, EqChain};
@@ -40,6 +40,7 @@ struct Stats {
     clipped: AtomicU64,
 }
 
+#[must_use]
 pub fn clamp_buffer(requested: u32, supported: &SupportedBufferSize) -> BufferSize {
     match supported {
         SupportedBufferSize::Range { min, max } => BufferSize::Fixed(requested.clamp(*min, *max)),
@@ -47,11 +48,24 @@ pub fn clamp_buffer(requested: u32, supported: &SupportedBufferSize) -> BufferSi
     }
 }
 
+/// Run the capture → EQ → playback engine until the process is killed.
+///
+/// # Errors
+/// Returns an error if device configs cannot be queried, no common sample
+/// rate can be negotiated, the EQ chain fails to build, or a stream cannot be
+/// built or started.
+// One linear setup routine (config negotiation → ring → callbacks → report);
+// splitting it hurts readability more than it helps, so `too_many_lines` is
+// allowed here specifically.
+#[allow(clippy::too_many_lines)]
 pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig) -> Result<()> {
     // Name our PipeWire node `oxideq` so pw-link / qpwgraph can find it for
     // manual routing. (pipewire-alsa reads PIPEWIRE_PROPS; harmless elsewhere.)
     if cfg!(target_os = "linux") {
-        std::env::set_var("PIPEWIRE_PROPS", "{ node.name = oxideq }");
+        // SAFETY: this is the first statement in `run()`, executed on the
+        // startup thread before any audio streams or threads are spawned, so no
+        // other thread can be reading the environment concurrently.
+        unsafe { std::env::set_var("PIPEWIRE_PROPS", "{ node.name = oxideq }") };
     }
 
     let in_default = input
@@ -178,7 +192,7 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
 
     let os_ms = os_latency_frames / f64::from(rate) * 1_000.0;
     let latency_ms =
-        (frames as f64 * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0 + os_ms;
+        (f64::from(frames) * (2 + PREFILL_BLOCKS) as f64) / f64::from(rate) * 1_000.0 + os_ms;
     let os_note = if cfg.oversample > 1 {
         format!(", {}x oversampled", cfg.oversample)
     } else {

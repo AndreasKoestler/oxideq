@@ -6,11 +6,11 @@ use oxideq::{cli, devices, engine, preset};
 fn main() -> Result<()> {
     match cli::Cli::parse().cmd {
         cli::Cmd::Devices => devices::list(&cpal::default_host()),
-        cli::Cmd::Run(a) => run(a),
+        cli::Cmd::Run(a) => run(&a),
     }
 }
 
-fn run(a: cli::RunArgs) -> Result<()> {
+fn run(a: &cli::RunArgs) -> Result<()> {
     let text = std::fs::read_to_string(&a.preset)
         .with_context(|| format!("reading preset {}", a.preset))?;
     let parsed = preset::parse(&text)?;

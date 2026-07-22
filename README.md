@@ -1,5 +1,7 @@
 # OxidEQ
 
+[![CI](https://github.com/AndreasKoestler/oxideq/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreasKoestler/oxideq/actions/workflows/ci.yml)
+
 Bit-perfect, system-wide parametric EQ pipeline in Rust. Captures a
 virtual sink, applies an Equalizer APO / AutoEQ preset (preamp + Direct
 Form 1 biquad cascade), and plays out to your DAC at the source's

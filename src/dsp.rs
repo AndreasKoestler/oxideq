@@ -6,12 +6,13 @@
 //! audio callback. Buffers are f32 (device format); all arithmetic,
 //! coefficients, and state are f64.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use biquad::{Biquad, Coefficients, DirectForm1, DirectForm2Transposed, ToHertz, Type};
 
 use crate::preset::{Band, FilterKind, Preset};
-use crate::resample::{Oversampler, MAX_FACTOR};
+use crate::resample::{MAX_FACTOR, Oversampler};
 
+#[must_use]
 pub fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
@@ -27,6 +28,10 @@ pub trait Filter: Send {
 /// rate. This is the bound the preset-driven constructor needs; a bare
 /// `Filter` (e.g. a test fixture) need not implement it.
 pub trait BandFilter: Filter + Sized {
+    /// Design this filter from a preset band at sample rate `fs`.
+    ///
+    /// # Errors
+    /// Returns an error if the band's parameters yield invalid coefficients.
     fn from_band(band: &Band, fs: f64) -> Result<Self>;
 }
 
@@ -98,36 +103,55 @@ impl<F: Filter> FilterCascade<F> {
     /// back to one output sample — still fully in place, no heap.
     pub(crate) fn process(&mut self, interleaved: &mut [f32]) {
         debug_assert_eq!(interleaved.len() % self.channels, 0);
-        match &mut self.os {
-            None => {
-                for frame in interleaved.chunks_exact_mut(self.channels) {
-                    for (sample, cascade) in frame.iter_mut().zip(self.stages.iter_mut()) {
-                        let mut x = f64::from(*sample) * self.preamp;
-                        for f in cascade.iter_mut() {
-                            x = f.run(x);
-                        }
-                        *sample = x as f32; // intentional narrowing back to device format
-                    }
-                }
+        if self.os.is_some() {
+            self.process_oversampled(interleaved);
+        } else {
+            self.process_direct(interleaved);
+        }
+    }
+
+    /// Run one f64 sample through a single channel's cascade of stages,
+    /// returning the filtered value. Shared by both process paths.
+    #[inline]
+    fn run_cascade(cascade: &mut [F], mut x: f64) -> f64 {
+        for f in cascade.iter_mut() {
+            x = f.run(x);
+        }
+        x
+    }
+
+    /// Direct (no-oversampling) path: widen each sample to f64, run preamp +
+    /// cascade, write it back in place.
+    fn process_direct(&mut self, interleaved: &mut [f32]) {
+        for frame in interleaved.chunks_exact_mut(self.channels) {
+            for (sample, cascade) in frame.iter_mut().zip(self.stages.iter_mut()) {
+                let x = f64::from(*sample) * self.preamp;
+                *sample = Self::run_cascade(cascade, x) as f32; // intentional narrowing back to device format
             }
-            Some(os) => {
-                let mut buf = [0.0f64; MAX_FACTOR];
-                for frame in interleaved.chunks_exact_mut(self.channels) {
-                    for ((sample, cascade), rs) in frame
-                        .iter_mut()
-                        .zip(self.stages.iter_mut())
-                        .zip(os.iter_mut())
-                    {
-                        let x = f64::from(*sample) * self.preamp;
-                        let n = rs.up(x, &mut buf);
-                        for s in &mut buf[..n] {
-                            for f in cascade.iter_mut() {
-                                *s = f.run(*s);
-                            }
-                        }
-                        *sample = rs.down(&mut buf) as f32;
-                    }
+        }
+    }
+
+    /// Oversampled path: upsample each sample to `factor` samples on a stack
+    /// buffer, run the cascade at the elevated rate, downsample back in place.
+    fn process_oversampled(&mut self, interleaved: &mut [f32]) {
+        // Split borrow of distinct fields keeps the RT path allocation-free:
+        // `os` and `stages` are disjoint, so the borrow checker lets us hold
+        // both mutably at once (no Vec/Box/`mem::take`).
+        let Some(os) = self.os.as_mut() else {
+            return;
+        };
+        let stages = &mut self.stages;
+        let mut buf = [0.0f64; MAX_FACTOR];
+        for frame in interleaved.chunks_exact_mut(self.channels) {
+            for ((sample, cascade), rs) in
+                frame.iter_mut().zip(stages.iter_mut()).zip(os.iter_mut())
+            {
+                let x = f64::from(*sample) * self.preamp;
+                let n = rs.up(x, &mut buf);
+                for s in &mut buf[..n] {
+                    *s = Self::run_cascade(cascade, *s);
                 }
+                *sample = rs.down(&mut buf) as f32;
             }
         }
     }
@@ -217,6 +241,10 @@ impl EqChain {
     /// Preset-driven chain with the default backend (`Df1`). `oversample`
     /// ∈ {1,2,4,8,16}: above 1 the cascade runs at `oversample × sample_rate_hz`
     /// behind halfband resamplers.
+    ///
+    /// # Errors
+    /// Returns an error if `oversample` is not a supported factor, or if any
+    /// band's Fc is at/above the device Nyquist or yields invalid coefficients.
     pub fn new(
         preset: &Preset,
         sample_rate_hz: f64,
@@ -233,6 +261,9 @@ impl EqChain {
     }
 
     /// As `new`, with an explicit filter backend.
+    ///
+    /// # Errors
+    /// Same conditions as [`EqChain::new`].
     pub fn with_backend(
         preset: &Preset,
         sample_rate_hz: f64,
@@ -265,6 +296,7 @@ impl EqChain {
         }
     }
 
+    #[must_use]
     pub fn num_bands(&self) -> usize {
         match self {
             EqChain::Df1(c) => c.num_bands(),
@@ -273,6 +305,7 @@ impl EqChain {
     }
 
     /// Resampler group delay in device-rate frames (0.0 when oversampling is off).
+    #[must_use]
     pub fn latency_frames(&self) -> f64 {
         match self {
             EqChain::Df1(c) => c.latency_frames(),
@@ -309,7 +342,7 @@ mod tests {
 
     /// Steady-state gain of `preset` at `freq`, in dB (second half of 1 s).
     fn gain_db_at(preset: &Preset, freq: f32, fs: f32) -> f32 {
-        let mut chain = EqChain::new(preset, fs as f64, 1, 1).unwrap();
+        let mut chain = EqChain::new(preset, f64::from(fs), 1, 1).unwrap();
         let input = sine(freq, fs, 1.0);
         let mut output = input.clone();
         chain.process(&mut output);
@@ -328,7 +361,7 @@ mod tests {
 
     /// Steady-state gain like `gain_db_at`, with an oversample factor.
     fn gain_db_at_os(preset: &Preset, freq: f32, fs: f32, factor: usize) -> f32 {
-        let mut chain = EqChain::new(preset, fs as f64, 1, factor).unwrap();
+        let mut chain = EqChain::new(preset, f64::from(fs), 1, factor).unwrap();
         let input = sine(freq, fs, 1.0);
         let mut output = input.clone();
         chain.process(&mut output);

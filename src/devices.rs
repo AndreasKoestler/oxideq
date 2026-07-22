@@ -1,7 +1,7 @@
 //! Device discovery, selection by name substring, and output sample-rate
 //! negotiation: lock the output to the source rate; warn on fallback.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, SampleFormat};
 
@@ -15,10 +15,13 @@ pub enum Direction {
 /// because a device vanished mid-enumeration).
 fn device_name(d: &Device) -> String {
     d.description()
-        .map(|desc| desc.name().to_string())
-        .unwrap_or_else(|_| "<unnamed>".into())
+        .map_or_else(|_| "<unnamed>".into(), |desc| desc.name().to_string())
 }
 
+/// Print input and output device names to stdout.
+///
+/// # Errors
+/// Returns an error if the host cannot enumerate its input or output devices.
 pub fn list(host: &Host) -> Result<()> {
     println!("Input devices:");
     for d in host.input_devices().context("enumerating input devices")? {
@@ -34,6 +37,12 @@ pub fn list(host: &Host) -> Result<()> {
     Ok(())
 }
 
+/// Find a device by case-insensitive name substring, or the default when
+/// `name_substr` is `None`.
+///
+/// # Errors
+/// Returns an error if enumeration fails, or if no default / matching device
+/// exists for `dir`.
 pub fn find(host: &Host, dir: Direction, name_substr: Option<&str>) -> Result<Device> {
     let Some(pat) = name_substr else {
         return match dir {
@@ -54,6 +63,7 @@ pub fn find(host: &Host, dir: Direction, name_substr: Option<&str>) -> Result<De
 /// Pick an output rate given `(min, max)` supported ranges. Exact match
 /// wins (`true`); otherwise the nearest range endpoint (`false`) — the OS
 /// will resample and the caller must warn.
+#[must_use]
 pub fn pick_rate(ranges: &[(u32, u32)], want: u32) -> Option<(u32, bool)> {
     if ranges.iter().any(|&(lo, hi)| want >= lo && want <= hi) {
         return Some((want, true));
@@ -66,6 +76,7 @@ pub fn pick_rate(ranges: &[(u32, u32)], want: u32) -> Option<(u32, bool)> {
 }
 
 /// True if `rate` falls inside any supported `(min, max)` range.
+#[must_use]
 pub fn rate_supported(ranges: &[(u32, u32)], rate: u32) -> bool {
     ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&rate))
 }
@@ -86,6 +97,10 @@ where
 /// output-supported rate, provided the input can also capture at it (the
 /// OS resamples the capture side; the caller must warn). No common rate
 /// is an error — proceeding would drift the ring and pitch-shift audio.
+///
+/// # Errors
+/// Returns an error if device configs cannot be queried, the output has no
+/// matching f32 config, or input and output share no common rate.
 pub fn negotiate_rate(
     input: &Device,
     output: &Device,
