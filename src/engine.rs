@@ -250,7 +250,9 @@ fn negotiated_stream_configs(
 
 /// Create and prime the SPSC ring, then build the capture and playback streams
 /// with their RT-safe callbacks. The callbacks allocate nothing: `scratch` and
-/// the ring are pre-allocated here and moved in.
+/// the ring are pre-allocated here and moved in. The callback bodies live in
+/// [`process_input_block`] and [`fill_output_block`] so they can be unit-tested
+/// without an audio device.
 ///
 /// # Errors
 /// Returns an error if either stream cannot be built for the negotiated config.
@@ -272,7 +274,6 @@ fn build_streams(
     let silence = vec![0.0f32; block * PREFILL_BLOCKS];
     prod.push_slice(&silence);
 
-    // Input callback: preamp + EQ, clip count, push. RT-safe.
     let chunk_samples = frame_aligned_chunk(MAX_CALLBACK_SAMPLES, ch);
     let mut scratch = vec![0.0f32; MAX_CALLBACK_SAMPLES];
     let in_stats = Arc::clone(stats);
@@ -280,42 +281,26 @@ fn build_streams(
         .build_input_stream(
             in_cfg,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                for chunk in data.chunks(chunk_samples) {
-                    // `data` is read-only; copy each chunk into the
-                    // pre-allocated scratch to EQ it in place. Chunking caps
-                    // the copy at scratch's size for any callback length.
-                    let s = &mut scratch[..chunk.len()];
-                    s.copy_from_slice(chunk);
-                    chain.process(s);
-                    // Count locally, touch the shared atomic at most once per
-                    // chunk.
-                    let clipped = count_clipped(s);
-                    if clipped > 0 {
-                        in_stats
-                            .clipped
-                            .fetch_add(clipped as u64, Ordering::Relaxed);
-                    }
-                    if prod.push_slice(s) < s.len() {
-                        in_stats.overruns.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                process_input_block(
+                    data,
+                    chunk_samples,
+                    &mut scratch,
+                    &mut chain,
+                    &mut prod,
+                    &in_stats,
+                );
             },
             |e| eprintln!("input stream error: {e}"),
             None,
         )
         .context("building input stream (is the device f32-capable at this rate?)")?;
 
-    // Output callback: pop or zero-fill. RT-safe.
     let out_stats = Arc::clone(stats);
     let output_stream = output
         .build_output_stream(
             out_cfg,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let n = cons.pop_slice(out);
-                if n < out.len() {
-                    out[n..].fill(0.0);
-                    out_stats.underruns.fetch_add(1, Ordering::Relaxed);
-                }
+                fill_output_block(out, &mut cons, &out_stats);
             },
             |e| eprintln!("output stream error: {e}"),
             None,
@@ -323,6 +308,46 @@ fn build_streams(
         .context("building output stream")?;
 
     Ok((input_stream, output_stream))
+}
+
+/// Input-callback body: preamp + EQ each frame-aligned chunk, count clips,
+/// push to the ring. RT-safe: allocates nothing.
+///
+/// `data` is read-only, so each chunk is copied into the pre-allocated
+/// `scratch` to EQ it in place; chunking caps the copy at scratch's size for
+/// any callback length. Clips are counted locally so the shared atomics are
+/// touched at most once per chunk. A chunk the ring cannot fully absorb
+/// counts as one overrun.
+fn process_input_block<P: Producer<Item = f32>>(
+    data: &[f32],
+    chunk_samples: usize,
+    scratch: &mut [f32],
+    chain: &mut EqChain,
+    prod: &mut P,
+    stats: &Stats,
+) {
+    for chunk in data.chunks(chunk_samples) {
+        let s = &mut scratch[..chunk.len()];
+        s.copy_from_slice(chunk);
+        chain.process(s);
+        let clipped = count_clipped(s);
+        if clipped > 0 {
+            stats.clipped.fetch_add(clipped as u64, Ordering::Relaxed);
+        }
+        if prod.push_slice(s) < s.len() {
+            stats.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Output-callback body: pop what the ring holds into `out`; when it comes up
+/// short, zero-fill the tail and count one underrun. RT-safe.
+fn fill_output_block<C: Consumer<Item = f32>>(out: &mut [f32], cons: &mut C, stats: &Stats) {
+    let n = cons.pop_slice(out);
+    if n < out.len() {
+        out[n..].fill(0.0);
+        stats.underruns.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Start capture, then playback.
@@ -448,6 +473,90 @@ mod tests {
         assert!(df2_os.contains(", DF2 biquads"));
         assert!(df2_os.contains(", 4x oversampled"));
         assert!(df2_os.contains("44100 Hz"));
+    }
+
+    /// Identity chain: 0 dB preamp, no bands, no oversampling — `process`
+    /// leaves samples untouched, so ring contents can be compared to input.
+    fn identity_chain() -> EqChain {
+        EqChain::new(&Preset::default(), 48_000.0, 2, 1).unwrap()
+    }
+
+    #[test]
+    fn process_input_block_pushes_all_chunks_in_order() {
+        let mut chain = identity_chain();
+        let (mut prod, mut cons) = HeapRb::<f32>::new(64).split();
+        let stats = Stats::default();
+        let data: Vec<f32> = (0..20).map(|i| (i as f32 / 32.0) - 0.3).collect();
+        let mut scratch = [0.0f32; 8];
+
+        // chunk_samples 8 < data.len() 20 forces three chunks (8+8+4).
+        process_input_block(&data, 8, &mut scratch, &mut chain, &mut prod, &stats);
+
+        let mut out = [0.0f32; 20];
+        assert_eq!(cons.pop_slice(&mut out), 20);
+        for (i, (got, want)) in out.iter().zip(&data).enumerate() {
+            assert!((got - want).abs() < 1e-6, "sample {i}: {got} != {want}");
+        }
+        assert_eq!(stats.overruns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.clipped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn process_input_block_counts_one_overrun_per_rejected_chunk() {
+        let mut chain = identity_chain();
+        // Ring holds 12: first 8-sample chunk fits, second fits only 4 of 8,
+        // third (4 samples) is fully rejected — two overruns.
+        let (mut prod, _cons) = HeapRb::<f32>::new(12).split();
+        let stats = Stats::default();
+        let data = [0.1f32; 20];
+        let mut scratch = [0.0f32; 8];
+
+        process_input_block(&data, 8, &mut scratch, &mut chain, &mut prod, &stats);
+
+        assert_eq!(stats.overruns.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn process_input_block_counts_clipped_samples_after_eq() {
+        let mut chain = identity_chain();
+        let (mut prod, _cons) = HeapRb::<f32>::new(64).split();
+        let stats = Stats::default();
+        // Identity chain passes the out-of-range samples through unchanged.
+        let data = [0.5f32, 1.5, -2.0, 0.0, 1.0, -1.0];
+        let mut scratch = [0.0f32; 8];
+
+        process_input_block(&data, 8, &mut scratch, &mut chain, &mut prod, &stats);
+
+        assert_eq!(stats.clipped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn fill_output_block_zero_fills_and_counts_underrun_when_ring_is_short() {
+        let (mut prod, mut cons) = HeapRb::<f32>::new(16).split();
+        let stats = Stats::default();
+        prod.push_slice(&[0.25f32; 4]);
+        // Sentinel garbage: the popped prefix must be overwritten, the
+        // starved tail zeroed.
+        let mut out = [9.9f32; 8];
+
+        fill_output_block(&mut out, &mut cons, &stats);
+
+        assert_eq!(&out[..4], &[0.25f32; 4]);
+        assert_eq!(&out[4..], &[0.0f32; 4]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn fill_output_block_pops_exactly_without_underrun() {
+        let (mut prod, mut cons) = HeapRb::<f32>::new(16).split();
+        let stats = Stats::default();
+        prod.push_slice(&[0.5f32; 8]);
+        let mut out = [9.9f32; 8];
+
+        fill_output_block(&mut out, &mut cons, &stats);
+
+        assert_eq!(out, [0.5f32; 8]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 0);
     }
 
     #[test]
