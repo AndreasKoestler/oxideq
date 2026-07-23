@@ -136,16 +136,16 @@ default source (mic) and default sink, and the playback→sink→monitor→input
 formed a feedback loop that a preset with any net gain drives to full-scale.
 
 **Fix:** stop oxideq's nodes from auto-connecting, so only *your* `pw-link`s
-exist. oxideq reads `PIPEWIRE_PROPS`; set it yourself when launching:
+exist. oxideq does not touch `PIPEWIRE_PROPS` itself — set it yourself when
+launching (pipewire-alsa reads it; harmless on other backends):
 
     PIPEWIRE_PROPS='{ node.name=oxideq node.autoconnect=false }' \
         oxideq run --preset presets/koss_porta_pro.txt --input pipewire --output pipewire
 
-`node.name=oxideq` keeps the node discoverable for `pw-link` (the same name
-oxideq uses by default); `node.autoconnect=false` is the part that kills the
-loop and the mic bleed. With autoconnect off, oxideq starts wired to nothing —
-you must run the `pw-link` commands above to route it. Setting `PIPEWIRE_PROPS`
-yourself fully overrides oxideq's default, so include `node.name` when you do.
+`node.name=oxideq` names the node so `pw-link` / qpwgraph can find it (the
+`oxideq:` prefix the routing commands above use); `node.autoconnect=false` is
+the part that kills the loop and the mic bleed. With autoconnect off, oxideq
+starts wired to nothing — you must run the `pw-link` commands above to route it.
 
 **Quiet output even at full volume:** check the DAC's *PipeWire* node volume,
 separate from its hardware knob — `wpctl status` then `wpctl set-volume <id> 1.0`.

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use cpal::traits::DeviceTrait;
 
 use oxideq::{cli, devices, dsp, engine, preset};
 
@@ -17,11 +18,12 @@ fn run(a: &cli::RunArgs) -> Result<()> {
     for w in &parsed.warnings {
         eprintln!("preset: {w}");
     }
-    warn_headroom(&parsed.preset);
 
     let host = cpal::default_host();
     let input = devices::find(&host, devices::Direction::Input, a.input.as_deref())?;
     let output = devices::find(&host, devices::Direction::Output, a.output.as_deref())?;
+
+    warn_headroom(&parsed.preset, &input);
 
     engine::run(
         &input,
@@ -38,12 +40,16 @@ fn run(a: &cli::RunArgs) -> Result<()> {
 
 /// The preamp is the only clipping protection — we never limit dynamically.
 /// Warn up front if the cascade's *summed* peak gain exceeds 0 dBFS: a
-/// full-scale input near that frequency would clip. Evaluated at 48 kHz — the
-/// peak of an EQ curve is set by its low/mid bands, so it barely moves with the
-/// actual run rate. Falls back silently if coefficients can't be built here
-/// (the engine surfaces that error properly when it opens the stream).
-fn warn_headroom(p: &preset::Preset) {
-    let Ok(peak_db) = dsp::peak_gain_db(p, 48_000.0) else {
+/// full-scale input near that frequency would clip. Swept at the input device's
+/// default rate so the Nyquist edge matches the real pipeline (falling back to
+/// 48 kHz if that rate can't be queried). Falls back silently if coefficients
+/// can't be built here (the engine surfaces that error properly when it opens
+/// the stream).
+fn warn_headroom(p: &preset::Preset, input: &cpal::Device) {
+    let fs = input
+        .default_input_config()
+        .map_or(48_000.0, |c| f64::from(c.sample_rate()));
+    let Ok(peak_db) = dsp::peak_gain_db(p, fs) else {
         return;
     };
     if peak_db > 0.0 {

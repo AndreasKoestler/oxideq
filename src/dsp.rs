@@ -368,6 +368,7 @@ pub fn peak_gain_db(preset: &Preset, fs: f64) -> Result<f64> {
 mod tests {
     use super::*;
     use crate::preset::{Band, FilterKind, Preset};
+    use proptest::prelude::*;
     use std::f32::consts::TAU;
 
     fn sine(freq: f32, fs: f32, secs: f32) -> Vec<f32> {
@@ -468,46 +469,57 @@ mod tests {
         assert!(gain_db_at(&p, 200.0, 48_000.0).abs() < 0.3);
     }
 
-    #[test]
-    fn peak_gain_of_flat_preset_is_the_preamp() {
-        let p = Preset {
-            preamp_db: -10.0,
-            bands: vec![],
-        };
-        assert!((peak_gain_db(&p, 48_000.0).unwrap() - (-10.0)).abs() < 0.01);
-    }
+    proptest! {
+        /// With no bands the cascade is pure preamp, so its peak gain is the
+        /// preamp in dB exactly (only float round-trip error).
+        #[test]
+        fn peak_gain_of_flat_preset_is_the_preamp(preamp_db in -24.0f64..24.0) {
+            let p = Preset { preamp_db, bands: vec![] };
+            prop_assert!((peak_gain_db(&p, 48_000.0).unwrap() - preamp_db).abs() < 1e-9);
+        }
 
-    #[test]
-    fn peak_gain_matches_a_single_bands_boost() {
-        // One +6 dB peak, 0 dB preamp → cascade peak ≈ +6 dB (cross-checks the
-        // analytic sweep against the sine-through-chain helper).
-        let p = one_band(FilterKind::Peaking, 1_000.0, 6.0, 1.0);
-        assert!((peak_gain_db(&p, 48_000.0).unwrap() - 6.0).abs() < 0.2);
-    }
+        /// A single peaking boost (0 dB preamp) peaks at its own gain, at fc.
+        /// The sweep can only under-read the true peak — the grid rarely lands
+        /// exactly on fc — so the bound is one-sided: never above the target,
+        /// at most a fraction of a dB below it.
+        #[test]
+        fn peak_gain_matches_a_single_bands_boost(
+            fc_hz in 40.0f64..15_000.0,
+            gain_db in 0.5f64..18.0,
+            q in 0.5f64..3.0,
+        ) {
+            let peak = peak_gain_db(&one_band(FilterKind::Peaking, fc_hz, gain_db, q), 48_000.0)
+                .unwrap();
+            prop_assert!(peak <= gain_db + 1e-9, "peak {peak} exceeded target {gain_db}");
+            prop_assert!(peak > gain_db - 0.05, "peak {peak} fell short of target {gain_db}");
+        }
 
-    #[test]
-    fn peak_gain_sums_the_cascade_not_the_largest_band() {
-        // Two +6 dB boosts at neighbouring low frequencies overlap, so the true
-        // peak exceeds either band alone — the case the old max-single-band
-        // check missed.
-        let p = Preset {
-            preamp_db: 0.0,
-            bands: vec![
-                Band {
-                    kind: FilterKind::Peaking,
-                    fc_hz: 40.0,
-                    gain_db: 6.0,
-                    q: 1.0,
-                },
-                Band {
-                    kind: FilterKind::Peaking,
-                    fc_hz: 60.0,
-                    gain_db: 6.0,
-                    q: 1.0,
-                },
-            ],
-        };
-        assert!(peak_gain_db(&p, 48_000.0).unwrap() > 7.0);
+        /// Two positive boosts stack: a peaking filter never dips below 0 dB, so
+        /// at either band's centre the other still adds gain. The cascade peak
+        /// therefore clears the larger single band — the case the old
+        /// max-single-band check missed — yet never exceeds the two summed.
+        #[test]
+        fn peak_gain_sums_the_cascade_not_the_largest_band(
+            fc1 in 30.0f64..12_000.0,
+            fc2 in 30.0f64..12_000.0,
+            g1 in 0.5f64..15.0,
+            g2 in 0.5f64..15.0,
+            q1 in 0.5f64..4.0,
+            q2 in 0.5f64..4.0,
+        ) {
+            let both = Preset {
+                preamp_db: 0.0,
+                bands: vec![
+                    Band { kind: FilterKind::Peaking, fc_hz: fc1, gain_db: g1, q: q1 },
+                    Band { kind: FilterKind::Peaking, fc_hz: fc2, gain_db: g2, q: q2 },
+                ],
+            };
+            let peak_both = peak_gain_db(&both, 48_000.0).unwrap();
+            let peak1 = peak_gain_db(&one_band(FilterKind::Peaking, fc1, g1, q1), 48_000.0).unwrap();
+            let peak2 = peak_gain_db(&one_band(FilterKind::Peaking, fc2, g2, q2), 48_000.0).unwrap();
+            prop_assert!(peak_both > peak1.max(peak2));
+            prop_assert!(peak_both <= peak1 + peak2 + 1e-9);
+        }
     }
 
     #[test]
