@@ -230,6 +230,24 @@ with a high `--oversample` factor. The choice is dispatched once per block, so
 it has no per-sample cost. `df1` keeps the historical (and bit-perfect at
 `--oversample 1`) behavior.
 
+### Measurement report
+
+`tools/measure_report.py` validates a preset end-to-end and renders an HTML
+report. It plays a log sine sweep through an isolated PipeWire chain (player →
+oxideq → recorder), recovers the transfer function by cross-spectrum, and
+checks four things: flat-preset transparency, accuracy against the analytic RBJ
+target, oversampling against the analog ideal, and near-Nyquist cramping.
+
+Needs `numpy`, `scipy`, `matplotlib`, and a running PipeWire session with
+`pw-cat`/`pw-record`/`pw-link`/`pw-metadata` on `PATH`. From the repo root
+after `cargo build --release`:
+
+    python3 tools/measure_report.py --preset presets/koss_porta_pro.txt \
+        --backend df1 --rate 48000 --oversample 4 --out eq-report
+
+Writes `eq-report/report.html` and its figures. `tools/measure_capture.sh` is
+the single-capture helper it drives.
+
 ## Roadmap (explicit non-goals for v1)
 
 - Format-shift hot reload (rate changes currently require restart).
