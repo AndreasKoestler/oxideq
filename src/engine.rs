@@ -184,10 +184,15 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     report_loop(&stats)
 }
 
-/// Name our `PipeWire` node `oxideq` so pw-link / qpwgraph can find it for
-/// manual routing. (pipewire-alsa reads `PIPEWIRE_PROPS`; harmless elsewhere.)
+/// Default our `PipeWire` node's name to `oxideq` so pw-link / qpwgraph can
+/// find it for manual routing — but only when the caller has not set
+/// `PIPEWIRE_PROPS` themselves. Overriding it (e.g.
+/// `PIPEWIRE_PROPS='{ node.name=oxideq node.autoconnect=false }'`) is how a
+/// user stops the session manager auto-wiring oxideq to the default devices —
+/// see README "Troubleshooting". (pipewire-alsa reads `PIPEWIRE_PROPS`;
+/// harmless elsewhere.)
 fn set_pipewire_node_name() {
-    if cfg!(target_os = "linux") {
+    if cfg!(target_os = "linux") && std::env::var_os("PIPEWIRE_PROPS").is_none() {
         // SAFETY: `run` calls this as its first statement, on the startup
         // thread before any audio stream or thread is spawned, so no other
         // thread can be reading the environment concurrently.

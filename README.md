@@ -115,13 +115,40 @@ Then `systemctl --user restart pipewire pipewire-pulse` and select
     pw-link oxideq:output_FL "<DAC>:playback_FL"
     pw-link oxideq:output_FR "<DAC>:playback_FR"
 
-If PipeWire auto-connected oxideq's playback back into the OxidEQ sink
-(a feedback loop, since it may be your default output), cut it:
+By default PipeWire's session manager auto-connects oxideq to your default
+devices — pulling your mic into the EQ input and wiring playback back into the
+OxidEQ sink. That last one is a feedback loop (the sink is your default output,
+which oxideq is also capturing). If you hit it, either disable autoconnect
+(strongly recommended — see [Troubleshooting](#troubleshooting)) or cut the
+stray links by hand each run:
 
     pw-link -d oxideq:output_FL OxidEQ-Sink:playback_FL
     pw-link -d oxideq:output_FR OxidEQ-Sink:playback_FR
 
 macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
+
+## Troubleshooting
+
+**Symptoms (Linux / PipeWire):** your microphone is audible through the EQ; a
+constant `N samples clipped in last 5 s` warning even with nothing playing; or
+runaway distortion. All the same cause — PipeWire auto-wired oxideq to the
+default source (mic) and default sink, and the playback→sink→monitor→input path
+formed a feedback loop that a preset with any net gain drives to full-scale.
+
+**Fix:** stop oxideq's nodes from auto-connecting, so only *your* `pw-link`s
+exist. oxideq reads `PIPEWIRE_PROPS`; set it yourself when launching:
+
+    PIPEWIRE_PROPS='{ node.name=oxideq node.autoconnect=false }' \
+        oxideq run --preset presets/koss_porta_pro.txt --input pipewire --output pipewire
+
+`node.name=oxideq` keeps the node discoverable for `pw-link` (the same name
+oxideq uses by default); `node.autoconnect=false` is the part that kills the
+loop and the mic bleed. With autoconnect off, oxideq starts wired to nothing —
+you must run the `pw-link` commands above to route it. Setting `PIPEWIRE_PROPS`
+yourself fully overrides oxideq's default, so include `node.name` when you do.
+
+**Quiet output even at full volume:** check the DAC's *PipeWire* node volume,
+separate from its hardware knob — `wpctl status` then `wpctl set-volume <id> 1.0`.
 
 ## Bit-perfect notes
 
