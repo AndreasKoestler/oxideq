@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use oxideq::{cli, devices, engine, preset};
+use oxideq::{cli, devices, dsp, engine, preset};
 
 fn main() -> Result<()> {
     match cli::Cli::parse().cmd {
@@ -37,12 +37,19 @@ fn run(a: &cli::RunArgs) -> Result<()> {
 }
 
 /// The preamp is the only clipping protection — we never limit dynamically.
-/// If the loudest boost outweighs the preamp cut, warn up front.
+/// Warn up front if the cascade's *summed* peak gain exceeds 0 dBFS: a
+/// full-scale input near that frequency would clip. Evaluated at 48 kHz — the
+/// peak of an EQ curve is set by its low/mid bands, so it barely moves with the
+/// actual run rate. Falls back silently if coefficients can't be built here
+/// (the engine surfaces that error properly when it opens the stream).
 fn warn_headroom(p: &preset::Preset) {
-    let max_boost = p.bands.iter().map(|b| b.gain_db).fold(0.0f64, f64::max);
-    if max_boost + p.preamp_db > 0.0 {
+    let Ok(peak_db) = dsp::peak_gain_db(p, 48_000.0) else {
+        return;
+    };
+    if peak_db > 0.0 {
         eprintln!(
-            "warning: max boost {max_boost:.1} dB exceeds preamp {:.1} dB — clipping possible",
+            "warning: preset peaks at {peak_db:+.1} dBFS (preamp {:.1} dB) — clipping possible; \
+             lower Preamp by ~{peak_db:.1} dB for full headroom",
             p.preamp_db
         );
     }
