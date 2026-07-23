@@ -5,7 +5,7 @@ use oxideq::{cli, devices, engine, preset};
 
 fn main() -> Result<()> {
     match cli::Cli::parse().cmd {
-        cli::Cmd::Devices => devices::list(&cpal::default_host()),
+        cli::Cmd::Devices(a) => devices::list(&cpal::default_host(), a.all),
         cli::Cmd::Run(a) => run(&a),
     }
 }

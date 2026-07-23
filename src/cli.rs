@@ -38,7 +38,15 @@ pub enum Cmd {
     /// Run the EQ pipeline
     Run(RunArgs),
     /// List audio devices
-    Devices,
+    Devices(DevicesArgs),
+}
+
+#[derive(Debug, Args, PartialEq)]
+pub struct DevicesArgs {
+    /// Show every ALSA PCM (routing plugins, surround/spdif variants) instead
+    /// of just the hardware devices and useful routes
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args, PartialEq)]
@@ -46,10 +54,14 @@ pub struct RunArgs {
     /// Equalizer APO / `AutoEQ` preset file
     #[arg(long)]
     pub preset: String,
-    /// Input device name substring, case-insensitive (default: system input)
+    /// Input device: exact backend id, else case-insensitive substring of its
+    /// name or id (see `oxideq devices`), e.g. `hw:CARD=S9Pro,DEV=0`
+    /// (default: system input)
     #[arg(long)]
     pub input: Option<String>,
-    /// Output device name substring, case-insensitive (default: system output)
+    /// Output device: exact backend id, else case-insensitive substring of its
+    /// name or id (see `oxideq devices`), e.g. `hw:CARD=S9Pro,DEV=0`
+    /// (default: system output)
     #[arg(long)]
     pub output: Option<String>,
     /// Requested block size in frames
@@ -81,7 +93,14 @@ mod tests {
 
     #[test]
     fn devices_command() {
-        assert!(matches!(parse(&["devices"]).unwrap().cmd, Cmd::Devices));
+        assert!(matches!(
+            parse(&["devices"]).unwrap().cmd,
+            Cmd::Devices(DevicesArgs { all: false })
+        ));
+        assert!(matches!(
+            parse(&["devices", "--all"]).unwrap().cmd,
+            Cmd::Devices(DevicesArgs { all: true })
+        ));
     }
 
     #[test]

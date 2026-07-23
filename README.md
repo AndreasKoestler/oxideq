@@ -30,6 +30,40 @@ processing only.
 For bit-perfect playback set BlackHole 2ch *and* the DAC to the source
 rate in Audio MIDI Setup. Details and limitations: [docs/macos.md](docs/macos.md).
 
+## Selecting a device
+
+`--input`/`--output` match case-insensitively against the device name *or* its
+backend id: an exact id match wins (so `hw:CARD=0,DEV=0` never lands on
+`plughw:CARD=0,DEV=0`, which contains it); otherwise the first device whose
+name or id contains the text. `oxideq devices` shows what you can pick:
+
+    Output devices:
+      Hidizs S9Pro, USB Audio
+        hw:CARD=0,DEV=0          bit-perfect (locks to the source rate)
+        plughw:CARD=0,DEV=0      auto rate/format conversion
+      ...
+      Routes (OS picks/mixes): jack, pipewire, pulse, default
+
+On Linux one physical DAC is exposed by ALSA under many names — the raw
+hardware device, a converting wrapper, and assorted routing plugins. Match on
+the **backend id** to pin the exact one; the name alone is ambiguous:
+
+- `hw:CARD=…,DEV=…` — **direct hardware, bit-perfect.** The right pick for this
+  tool. Rate-strict: oxideq locks the pipeline to the source rate, and if the
+  DAC can't open at it you get a fallback warning or an error (see
+  [Bit-perfect notes](#bit-perfect-notes)).
+
+      oxideq run --preset p.txt --input OxidEQ-Sink --output hw:CARD=0,DEV=0
+
+- `plughw:CARD=…,DEV=…` — hardware **with** ALSA's automatic rate/format
+  conversion. Use it if `hw:` refuses your rate and you accept resampling.
+- `jack` / `pipewire` / `pulse` / `default` — hand off to the sound server; it
+  routes and may resample. Convenient, not bit-perfect.
+
+`oxideq devices` shows only hardware devices and these routes by default. Add
+`--all` to dump every ALSA PCM (the `surround*`, `iec958`, `sysdefault`,
+`front`, `usbstream`, … plugin variants) if you need one of them.
+
 ## Presets
 
 Presets are standard AutoEQ output ("Equalizer APO parametric" format):
@@ -103,6 +137,19 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
       context.properties = {
           default.clock.allowed-rates = [ 44100 48000 88200 96000 176400 192000 ]
       }
+
+  List only rates your DAC actually supports. On Linux, read them from
+  the card's ALSA stream info (no extra tools; replace `card0` with your
+  card — `cat /proc/asound/cards` shows the index):
+
+      cat /proc/asound/card0/stream0 | grep -m1 Rates
+      # Rates: 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, ...
+
+  `aplay -v --dump-hw-params -D hw:CARD=0,DEV=0 /dev/zero` also prints a
+  `RATE:` line (needs `alsa-utils`). Keep the list to rates real content
+  uses (through 192000, occasionally 384000); a needlessly high graph
+  clock just burns CPU on every stream. macOS: Audio MIDI Setup shows the
+  device's rates.
 
 - The preamp is a constant linear multiplier — the only headroom
   mechanism. oxideq counts clipped samples and warns; it never limits.
