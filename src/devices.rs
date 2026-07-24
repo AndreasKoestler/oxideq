@@ -84,81 +84,145 @@ fn print_section(devices: impl Iterator<Item = Device>, all: bool) {
 }
 
 /// Print each device once (deduped by backend id, first-seen order), annotating
-/// the display name with its id when one is available. Devices without an id
-/// are never deduped — an id-less host must not collapse onto its first device.
+/// the display name with its id when one is available.
 fn print_all(devices: impl Iterator<Item = Device>) {
+    for line in render_all(devices.map(|d| (device_name(&d), device_id(&d)))) {
+        println!("  {line}");
+    }
+}
+
+/// Format the `--all` listing: each device once, deduped by backend id in
+/// first-seen order, as `name  [id]` (or bare `name` when id-less). Devices
+/// without an id are never deduped — an id-less host must not collapse onto its
+/// first device. Pure so the dedup/formatting is unit-testable.
+fn render_all<I: IntoIterator<Item = (String, String)>>(devices: I) -> Vec<String> {
     let mut seen = HashSet::new();
-    for d in devices {
-        let id = device_id(&d);
-        if !id.is_empty() && !seen.insert(id.clone()) {
-            continue;
-        }
-        let name = device_name(&d);
+    let mut lines = Vec::new();
+    for (name, id) in devices {
         if id.is_empty() {
-            println!("  {name}");
-        } else {
-            println!("  {name}  [{id}]");
+            lines.push(name);
+        } else if seen.insert(id.clone()) {
+            lines.push(format!("{name}  [{id}]"));
         }
     }
+    lines
+}
+
+/// Devices bucketed for the curated view: hardware cards (with their
+/// `hw`/`plughw` selectors), well-known system routes, and everything else
+/// (hosts without ALSA-style ids).
+struct Curated {
+    cards: Vec<CardGroup>,
+    routes: Vec<String>,
+    other: Vec<String>,
+}
+
+/// Index of the card group keyed by `key`, appending a new one (named `name`,
+/// no selectors yet) when none exists.
+fn card_slot(cards: &mut Vec<CardGroup>, key: &str, name: String) -> usize {
+    if let Some(i) = cards.iter().position(|g| g.key == key) {
+        return i;
+    }
+    cards.push(CardGroup {
+        key: key.to_owned(),
+        name,
+        hw: None,
+        plughw: None,
+    });
+    cards.len() - 1
+}
+
+/// Append `value` unless the bucket already holds it (first-seen dedup).
+fn push_unique(bucket: &mut Vec<String>, value: String) {
+    if !bucket.contains(&value) {
+        bucket.push(value);
+    }
+}
+
+impl Curated {
+    /// Route one `(name, id)` device into its bucket: a card's `hw`/`plughw`
+    /// selector, a well-known system route, or `other` (deduped).
+    fn add(&mut self, name: String, id: String) {
+        if let Some((prefix, key)) = split_card_id(&id) {
+            let idx = card_slot(&mut self.cards, key, name);
+            // split_card_id yields only "hw" or "plughw"; else is "plughw".
+            if prefix == "hw" {
+                self.cards[idx].hw = Some(id);
+            } else {
+                self.cards[idx].plughw = Some(id);
+            }
+        } else if ROUTE_IDS.contains(&id.as_str()) {
+            push_unique(&mut self.routes, id);
+        } else {
+            // Hosts without ALSA-style ids (CoreAudio, WASAPI): keep the name so
+            // the curated view isn't empty there.
+            push_unique(&mut self.other, name);
+        }
+    }
+}
+
+/// Bucket `(name, id)` pairs into hardware card groups (a card's `hw`/`plughw`
+/// selectors merged under one entry), well-known system routes, and everything
+/// else. Pure so the grouping logic is unit-testable without real audio devices.
+fn curate(devices: Vec<(String, String)>) -> Curated {
+    let mut curated = Curated {
+        cards: Vec::new(),
+        routes: Vec::new(),
+        other: Vec::new(),
+    };
+    for (name, id) in devices {
+        curated.add(name, id);
+    }
+    curated
+}
+
+/// Output lines for one card: its name, then whichever of the bit-perfect
+/// (`hw`) and converting (`plughw`) selectors it has.
+fn render_card(g: &CardGroup) -> Vec<String> {
+    let mut lines = vec![format!("  {}", g.name)];
+    if let Some(id) = &g.hw {
+        lines.push(format!(
+            "    {id:<24} bit-perfect (locks to the source rate)"
+        ));
+    }
+    if let Some(id) = &g.plughw {
+        lines.push(format!("    {id:<24} auto rate/format conversion"));
+    }
+    lines
+}
+
+/// Format the curated buckets into indented output lines. Empty only when
+/// there is genuinely nothing to show (no cards, routes, or others) — the
+/// caller prints the "none found" hint. Pure so the layout is unit-testable.
+fn render_curated(curated: &Curated) -> Vec<String> {
+    if curated.cards.is_empty() && curated.routes.is_empty() {
+        return curated
+            .other
+            .iter()
+            .map(|name| format!("  {name}"))
+            .collect();
+    }
+    let mut lines: Vec<String> = curated.cards.iter().flat_map(render_card).collect();
+    if !curated.routes.is_empty() {
+        lines.push(format!(
+            "  Routes (OS picks/mixes): {}",
+            curated.routes.join(", ")
+        ));
+    }
+    lines
 }
 
 /// Group `hw`/`plughw` selectors under each card and list system routes; skip
 /// the plugin variants (`--all` shows those).
 fn print_curated(devices: impl Iterator<Item = Device>) {
-    let mut cards: Vec<CardGroup> = Vec::new();
-    let mut routes: Vec<String> = Vec::new();
-    // Hosts without ALSA-style ids (CoreAudio, WASAPI) match neither branch
-    // below; keep their names so the curated view isn't empty there.
-    let mut other: Vec<String> = Vec::new();
-    for d in devices {
-        let id = device_id(&d);
-        if let Some((prefix, key)) = split_card_id(&id) {
-            let idx = cards.iter().position(|g| g.key == key).unwrap_or_else(|| {
-                cards.push(CardGroup {
-                    key: key.to_owned(),
-                    name: device_name(&d),
-                    hw: None,
-                    plughw: None,
-                });
-                cards.len() - 1
-            });
-            match prefix {
-                "hw" => cards[idx].hw = Some(id),
-                "plughw" => cards[idx].plughw = Some(id),
-                _ => {}
-            }
-        } else if ROUTE_IDS.contains(&id.as_str()) {
-            if !routes.contains(&id) {
-                routes.push(id);
-            }
-        } else {
-            let name = device_name(&d);
-            if !other.contains(&name) {
-                other.push(name);
-            }
-        }
-    }
-    if cards.is_empty() && routes.is_empty() {
-        if other.is_empty() {
-            println!("  (none found; try `oxideq devices --all`)");
-        } else {
-            for name in &other {
-                println!("  {name}");
-            }
-        }
+    let curated = curate(devices.map(|d| (device_name(&d), device_id(&d))).collect());
+    let lines = render_curated(&curated);
+    if lines.is_empty() {
+        println!("  (none found; try `oxideq devices --all`)");
         return;
     }
-    for g in &cards {
-        println!("  {}", g.name);
-        if let Some(id) = &g.hw {
-            println!("    {id:<24} bit-perfect (locks to the source rate)");
-        }
-        if let Some(id) = &g.plughw {
-            println!("    {id:<24} auto rate/format conversion");
-        }
-    }
-    if !routes.is_empty() {
-        println!("  Routes (OS picks/mixes): {}", routes.join(", "));
+    for line in lines {
+        println!("{line}");
     }
 }
 
@@ -178,14 +242,11 @@ fn split_card_id(id: &str) -> Option<(&str, &str)> {
 /// (`hw:CARD=…` sits inside `plughw:CARD=…`), so substring alone would leave
 /// the pick to enumeration order. Otherwise the first name/id substring match.
 fn best_match(devices: &[(String, String)], needle: &str) -> Option<usize> {
-    devices
-        .iter()
-        .position(|(_, id)| id == needle)
-        .or_else(|| {
-            devices
-                .iter()
-                .position(|(name, id)| name.contains(needle) || id.contains(needle))
-        })
+    devices.iter().position(|(_, id)| id == needle).or_else(|| {
+        devices
+            .iter()
+            .position(|(name, id)| name.contains(needle) || id.contains(needle))
+    })
 }
 
 /// Find a device by its backend id or display name (see `list`), or the
@@ -375,5 +436,77 @@ mod tests {
         assert!(rate_supported(&[(44_100, 48_000)], 48_000));
         assert!(!rate_supported(&[(44_100, 48_000)], 96_000));
         assert!(!rate_supported(&[], 48_000));
+    }
+
+    fn pair(name: &str, id: &str) -> (String, String) {
+        (name.to_owned(), id.to_owned())
+    }
+
+    #[test]
+    fn curate_merges_hw_and_plughw_under_one_card() {
+        let c = curate(vec![
+            pair("S9 Pro", "hw:CARD=S9Pro,DEV=0"),
+            pair("S9 Pro", "plughw:CARD=S9Pro,DEV=0"),
+        ]);
+        assert_eq!(c.cards.len(), 1);
+        assert_eq!(c.cards[0].name, "S9 Pro");
+        assert_eq!(c.cards[0].hw.as_deref(), Some("hw:CARD=S9Pro,DEV=0"));
+        assert_eq!(
+            c.cards[0].plughw.as_deref(),
+            Some("plughw:CARD=S9Pro,DEV=0")
+        );
+        assert!(c.routes.is_empty());
+        assert!(c.other.is_empty());
+    }
+
+    #[test]
+    fn curate_collects_known_routes_deduped_and_keeps_others_by_name() {
+        let c = curate(vec![
+            pair("Default", "default"),
+            pair("PipeWire", "pipewire"),
+            pair("Default", "default"),   // duplicate id — dropped
+            pair("MacBook Speakers", ""), // no ALSA id — falls to `other`
+            pair("MacBook Speakers", ""), // duplicate name — dropped
+        ]);
+        assert!(c.cards.is_empty());
+        assert_eq!(c.routes, ["default", "pipewire"]);
+        assert_eq!(c.other, ["MacBook Speakers"]);
+    }
+
+    #[test]
+    fn render_curated_lists_selectors_and_routes() {
+        let c = curate(vec![
+            pair("S9 Pro", "hw:CARD=S9Pro,DEV=0"),
+            pair("S9 Pro", "plughw:CARD=S9Pro,DEV=0"),
+            pair("Default", "default"),
+        ]);
+        let lines = render_curated(&c);
+        assert_eq!(lines[0], "  S9 Pro");
+        assert!(lines[1].contains("hw:CARD=S9Pro,DEV=0") && lines[1].contains("bit-perfect"));
+        assert!(lines[2].contains("plughw:CARD=S9Pro,DEV=0") && lines[2].contains("auto rate"));
+        assert_eq!(lines[3], "  Routes (OS picks/mixes): default");
+    }
+
+    #[test]
+    fn render_curated_is_empty_when_nothing_found() {
+        let c = curate(Vec::new());
+        assert!(render_curated(&c).is_empty());
+        // Others-only (no cards/routes) still renders their names.
+        let only_other = curate(vec![pair("Speakers", "")]);
+        assert_eq!(render_curated(&only_other), ["  Speakers"]);
+    }
+
+    #[test]
+    fn render_all_dedups_by_id_and_keeps_idless() {
+        let lines = render_all([
+            pair("S9 Pro", "hw:CARD=S9Pro,DEV=0"),
+            pair("S9 Pro alias", "hw:CARD=S9Pro,DEV=0"), // same id — dropped
+            pair("Speakers", ""),                        // id-less — always kept
+            pair("Speakers", ""),                        // id-less again — also kept
+        ]);
+        assert_eq!(
+            lines,
+            ["S9 Pro  [hw:CARD=S9Pro,DEV=0]", "Speakers", "Speakers",]
+        );
     }
 }
