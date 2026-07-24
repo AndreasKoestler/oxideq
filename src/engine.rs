@@ -152,8 +152,6 @@ fn stats_warnings(underruns: u64, overruns: u64, clipped: u64) -> Vec<String> {
 /// rate can be negotiated, the EQ chain fails to build, or a stream cannot be
 /// built or started.
 pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig) -> Result<()> {
-    set_pipewire_node_name();
-
     let (in_cfg, out_cfg, rate) = negotiated_stream_configs(input, output, cfg)?;
     let frames = block_frames(in_cfg.buffer_size, out_cfg.buffer_size, cfg.buffer_frames);
     let ch = cfg.channels as usize;
@@ -182,17 +180,6 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
     );
 
     report_loop(&stats)
-}
-
-/// Name our `PipeWire` node `oxideq` so pw-link / qpwgraph can find it for
-/// manual routing. (pipewire-alsa reads `PIPEWIRE_PROPS`; harmless elsewhere.)
-fn set_pipewire_node_name() {
-    if cfg!(target_os = "linux") {
-        // SAFETY: `run` calls this as its first statement, on the startup
-        // thread before any audio stream or thread is spawned, so no other
-        // thread can be reading the environment concurrently.
-        unsafe { std::env::set_var("PIPEWIRE_PROPS", "{ node.name = oxideq }") };
-    }
 }
 
 /// Query both devices, negotiate one shared sample rate, and assemble the

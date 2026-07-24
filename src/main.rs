@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use cpal::traits::DeviceTrait;
 
-use oxideq::{cli, devices, engine, preset};
+use oxideq::{cli, devices, dsp, engine, preset};
 
 fn main() -> Result<()> {
     match cli::Cli::parse().cmd {
-        cli::Cmd::Devices => devices::list(&cpal::default_host()),
+        cli::Cmd::Devices(a) => devices::list(&cpal::default_host(), a.all),
         cli::Cmd::Run(a) => run(&a),
     }
 }
@@ -17,11 +18,12 @@ fn run(a: &cli::RunArgs) -> Result<()> {
     for w in &parsed.warnings {
         eprintln!("preset: {w}");
     }
-    warn_headroom(&parsed.preset);
 
     let host = cpal::default_host();
     let input = devices::find(&host, devices::Direction::Input, a.input.as_deref())?;
     let output = devices::find(&host, devices::Direction::Output, a.output.as_deref())?;
+
+    warn_headroom(&parsed.preset, &input);
 
     engine::run(
         &input,
@@ -37,12 +39,23 @@ fn run(a: &cli::RunArgs) -> Result<()> {
 }
 
 /// The preamp is the only clipping protection — we never limit dynamically.
-/// If the loudest boost outweighs the preamp cut, warn up front.
-fn warn_headroom(p: &preset::Preset) {
-    let max_boost = p.bands.iter().map(|b| b.gain_db).fold(0.0f64, f64::max);
-    if max_boost + p.preamp_db > 0.0 {
+/// Warn up front if the cascade's *summed* peak gain exceeds 0 dBFS: a
+/// full-scale input near that frequency would clip. Swept at the input device's
+/// default rate so the Nyquist edge matches the real pipeline (falling back to
+/// 48 kHz if that rate can't be queried). Falls back silently if coefficients
+/// can't be built here (the engine surfaces that error properly when it opens
+/// the stream).
+fn warn_headroom(p: &preset::Preset, input: &cpal::Device) {
+    let fs = input
+        .default_input_config()
+        .map_or(48_000.0, |c| f64::from(c.sample_rate()));
+    let Ok(peak_db) = dsp::peak_gain_db(p, fs) else {
+        return;
+    };
+    if peak_db > 0.0 {
         eprintln!(
-            "warning: max boost {max_boost:.1} dB exceeds preamp {:.1} dB — clipping possible",
+            "warning: preset peaks at {peak_db:+.1} dBFS (preamp {:.1} dB) — clipping possible; \
+             lower Preamp by ~{peak_db:.1} dB for full headroom",
             p.preamp_db
         );
     }

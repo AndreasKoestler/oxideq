@@ -342,13 +342,18 @@ Filter 1: ON PK Fc 105 Hz Gain -1.1 dB Q 0.70
     fn parses_koss_porta_pro_exactly() {
         assert_preset(
             include_str!("../presets/koss_porta_pro.txt"),
-            -13.16,
+            -15.48,
             &[
-                (FilterKind::LowShelf, 105.0, 18.9, 0.70),
-                (FilterKind::Peaking, 66.6, -14.7, 0.43),
-                (FilterKind::Peaking, 1531.9, 2.3, 0.18),
-                (FilterKind::Peaking, 4853.0, -6.7, 2.99),
-                (FilterKind::HighShelf, 10000.0, 0.2, 0.70),
+                (FilterKind::LowShelf, 105.0, 5.5, 0.70),
+                (FilterKind::Peaking, 20.0, 7.6, 6.00),
+                (FilterKind::Peaking, 27.4, 5.4, 1.47),
+                (FilterKind::Peaking, 100.1, -5.2, 0.61),
+                (FilterKind::Peaking, 213.6, -1.2, 1.22),
+                (FilterKind::Peaking, 755.3, 1.0, 1.27),
+                (FilterKind::Peaking, 1194.7, 1.8, 0.93),
+                (FilterKind::Peaking, 3372.2, 3.6, 4.19),
+                (FilterKind::Peaking, 4714.6, -5.1, 3.12),
+                (FilterKind::HighShelf, 10000.0, -0.5, 0.70),
             ],
         );
     }

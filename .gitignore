@@ -1,2 +1,3 @@
 /target
 /.rust-quality
+__pycache__/

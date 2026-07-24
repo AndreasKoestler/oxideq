@@ -30,6 +30,40 @@ processing only.
 For bit-perfect playback set BlackHole 2ch *and* the DAC to the source
 rate in Audio MIDI Setup. Details and limitations: [docs/macos.md](docs/macos.md).
 
+## Selecting a device
+
+`--input`/`--output` match case-insensitively against the device name *or* its
+backend id: an exact id match wins (so `hw:CARD=0,DEV=0` never lands on
+`plughw:CARD=0,DEV=0`, which contains it); otherwise the first device whose
+name or id contains the text. `oxideq devices` shows what you can pick:
+
+    Output devices:
+      Hidizs S9Pro, USB Audio
+        hw:CARD=0,DEV=0          bit-perfect (locks to the source rate)
+        plughw:CARD=0,DEV=0      auto rate/format conversion
+      ...
+      Routes (OS picks/mixes): jack, pipewire, pulse, default
+
+On Linux one physical DAC is exposed by ALSA under many names — the raw
+hardware device, a converting wrapper, and assorted routing plugins. Match on
+the **backend id** to pin the exact one; the name alone is ambiguous:
+
+- `hw:CARD=…,DEV=…` — **direct hardware, bit-perfect.** The right pick for this
+  tool. Rate-strict: oxideq locks the pipeline to the source rate, and if the
+  DAC can't open at it you get a fallback warning or an error (see
+  [Bit-perfect notes](#bit-perfect-notes)).
+
+      oxideq run --preset p.txt --input OxidEQ-Sink --output hw:CARD=0,DEV=0
+
+- `plughw:CARD=…,DEV=…` — hardware **with** ALSA's automatic rate/format
+  conversion. Use it if `hw:` refuses your rate and you accept resampling.
+- `jack` / `pipewire` / `pulse` / `default` — hand off to the sound server; it
+  routes and may resample. Convenient, not bit-perfect.
+
+`oxideq devices` shows only hardware devices and these routes by default. Add
+`--all` to dump every ALSA PCM (the `surround*`, `iec958`, `sysdefault`,
+`front`, `usbstream`, … plugin variants) if you need one of them.
+
 ## Presets
 
 Presets are standard AutoEQ output ("Equalizer APO parametric" format):
@@ -81,13 +115,40 @@ Then `systemctl --user restart pipewire pipewire-pulse` and select
     pw-link oxideq:output_FL "<DAC>:playback_FL"
     pw-link oxideq:output_FR "<DAC>:playback_FR"
 
-If PipeWire auto-connected oxideq's playback back into the OxidEQ sink
-(a feedback loop, since it may be your default output), cut it:
+By default PipeWire's session manager auto-connects oxideq to your default
+devices — pulling your mic into the EQ input and wiring playback back into the
+OxidEQ sink. That last one is a feedback loop (the sink is your default output,
+which oxideq is also capturing). If you hit it, either disable autoconnect
+(strongly recommended — see [Troubleshooting](#troubleshooting)) or cut the
+stray links by hand each run:
 
     pw-link -d oxideq:output_FL OxidEQ-Sink:playback_FL
     pw-link -d oxideq:output_FR OxidEQ-Sink:playback_FR
 
 macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
+
+## Troubleshooting
+
+**Symptoms (Linux / PipeWire):** your microphone is audible through the EQ; a
+constant `N samples clipped in last 5 s` warning even with nothing playing; or
+runaway distortion. All the same cause — PipeWire auto-wired oxideq to the
+default source (mic) and default sink, and the playback→sink→monitor→input path
+formed a feedback loop that a preset with any net gain drives to full-scale.
+
+**Fix:** stop oxideq's nodes from auto-connecting, so only *your* `pw-link`s
+exist. oxideq does not touch `PIPEWIRE_PROPS` itself — set it yourself when
+launching (pipewire-alsa reads it; harmless on other backends):
+
+    PIPEWIRE_PROPS='{ node.name=oxideq node.autoconnect=false }' \
+        oxideq run --preset presets/koss_porta_pro.txt --input pipewire --output pipewire
+
+`node.name=oxideq` names the node so `pw-link` / qpwgraph can find it (the
+`oxideq:` prefix the routing commands above use); `node.autoconnect=false` is
+the part that kills the loop and the mic bleed. With autoconnect off, oxideq
+starts wired to nothing — you must run the `pw-link` commands above to route it.
+
+**Quiet output even at full volume:** check the DAC's *PipeWire* node volume,
+separate from its hardware knob — `wpctl status` then `wpctl set-volume <id> 1.0`.
 
 ## Bit-perfect notes
 
@@ -103,6 +164,19 @@ macOS: see [docs/macos.md](docs/macos.md) (BlackHole 2ch as the sink).
       context.properties = {
           default.clock.allowed-rates = [ 44100 48000 88200 96000 176400 192000 ]
       }
+
+  List only rates your DAC actually supports. On Linux, read them from
+  the card's ALSA stream info (no extra tools; replace `card0` with your
+  card — `cat /proc/asound/cards` shows the index):
+
+      cat /proc/asound/card0/stream0 | grep -m1 Rates
+      # Rates: 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, ...
+
+  `aplay -v --dump-hw-params -D hw:CARD=0,DEV=0 /dev/zero` also prints a
+  `RATE:` line (needs `alsa-utils`). Keep the list to rates real content
+  uses (through 192000, occasionally 384000); a needlessly high graph
+  clock just burns CPU on every stream. macOS: Audio MIDI Setup shows the
+  device's rates.
 
 - The preamp is a constant linear multiplier — the only headroom
   mechanism. oxideq counts clipped samples and warns; it never limits.
@@ -155,6 +229,24 @@ better-conditioned at very high internal sample rates, so it pairs naturally
 with a high `--oversample` factor. The choice is dispatched once per block, so
 it has no per-sample cost. `df1` keeps the historical (and bit-perfect at
 `--oversample 1`) behavior.
+
+### Measurement report
+
+`tools/measure_report.py` validates a preset end-to-end and renders an HTML
+report. It plays a log sine sweep through an isolated PipeWire chain (player →
+oxideq → recorder), recovers the transfer function by cross-spectrum, and
+checks four things: flat-preset transparency, accuracy against the analytic RBJ
+target, oversampling against the analog ideal, and near-Nyquist cramping.
+
+Needs `numpy`, `scipy`, `matplotlib`, and a running PipeWire session with
+`pw-cat`/`pw-record`/`pw-link`/`pw-metadata` on `PATH`. From the repo root
+after `cargo build --release`:
+
+    python3 tools/measure_report.py --preset presets/koss_porta_pro.txt \
+        --backend df1 --rate 48000 --oversample 4 --out eq-report
+
+Writes `eq-report/report.html` and its figures. `tools/measure_capture.sh` is
+the single-capture helper it drives.
 
 ## Roadmap (explicit non-goals for v1)
 

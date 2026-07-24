@@ -324,10 +324,51 @@ fn coefficients(band: &Band, fs: f64) -> Result<Coefficients<f64>> {
         .map_err(|e| anyhow!("invalid filter (Fc {} Hz, Q {}): {e:?}", band.fc_hz, band.q))
 }
 
+/// Magnitude `|H(e^{jw})|` of one normalized biquad (`a0 == 1`) at angular
+/// frequency `w` (radians/sample).
+fn biquad_mag(c: &Coefficients<f64>, w: f64) -> f64 {
+    let (c1, s1) = (w.cos(), w.sin());
+    let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
+    let num = (c.b0 + c.b1 * c1 + c.b2 * c2).hypot(c.b1 * s1 + c.b2 * s2);
+    let den = (1.0 + c.a1 * c1 + c.a2 * c2).hypot(c.a1 * s1 + c.a2 * s2);
+    num / den
+}
+
+/// Worst-case gain of the whole cascade (preamp × every filter) from 10 Hz to
+/// Nyquist at `fs`, in dB. A value `> 0` means a full-scale input near the
+/// peak frequency can clip. This sweeps the *summed* magnitude response, so
+/// stacked boosts are caught — unlike comparing the single largest band gain,
+/// which misses several modest boosts piling up at nearby frequencies.
+///
+/// # Errors
+/// Returns an error if any band's parameters yield invalid coefficients.
+pub fn peak_gain_db(preset: &Preset, fs: f64) -> Result<f64> {
+    let coeffs = preset
+        .bands
+        .iter()
+        .map(|b| coefficients(b, fs))
+        .collect::<Result<Vec<_>>>()?;
+    let preamp = db_to_linear(preset.preamp_db);
+    // Sweep to Nyquist, not the audible edge: a boost above 20 kHz still
+    // overflows the sample and folds back into the band as aliasing.
+    let f_hi = 0.5 * fs;
+    let n = 1024usize;
+    let mut peak = 0.0f64;
+    for i in 0..n {
+        let frac = i as f64 / (n - 1) as f64;
+        let f = 10.0 * (f_hi / 10.0).powf(frac); // log-spaced 10 Hz .. f_hi
+        let w = std::f64::consts::TAU * f / fs;
+        let mag = coeffs.iter().fold(preamp, |m, c| m * biquad_mag(c, w));
+        peak = peak.max(mag);
+    }
+    Ok(20.0 * peak.log10())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::preset::{Band, FilterKind, Preset};
+    use proptest::prelude::*;
     use std::f32::consts::TAU;
 
     fn sine(freq: f32, fs: f32, secs: f32) -> Vec<f32> {
@@ -426,6 +467,59 @@ mod tests {
         let p = one_band(FilterKind::HighShelf, 10_000.0, -4.0, 0.7);
         assert!((gain_db_at(&p, 20_000.0, 48_000.0) + 4.0).abs() < 0.5);
         assert!(gain_db_at(&p, 200.0, 48_000.0).abs() < 0.3);
+    }
+
+    proptest! {
+        /// With no bands the cascade is pure preamp, so its peak gain is the
+        /// preamp in dB exactly (only float round-trip error).
+        #[test]
+        fn peak_gain_of_flat_preset_is_the_preamp(preamp_db in -24.0f64..24.0) {
+            let p = Preset { preamp_db, bands: vec![] };
+            prop_assert!((peak_gain_db(&p, 48_000.0).unwrap() - preamp_db).abs() < 1e-9);
+        }
+
+        /// A single peaking boost (0 dB preamp) peaks at its own gain, at fc.
+        /// The sweep can only under-read the true peak — the grid rarely lands
+        /// exactly on fc — so the bound is one-sided: never above the target,
+        /// at most a fraction of a dB below it.
+        #[test]
+        fn peak_gain_matches_a_single_bands_boost(
+            fc_hz in 40.0f64..15_000.0,
+            gain_db in 0.5f64..18.0,
+            q in 0.5f64..3.0,
+        ) {
+            let peak = peak_gain_db(&one_band(FilterKind::Peaking, fc_hz, gain_db, q), 48_000.0)
+                .unwrap();
+            prop_assert!(peak <= gain_db + 1e-9, "peak {peak} exceeded target {gain_db}");
+            prop_assert!(peak > gain_db - 0.05, "peak {peak} fell short of target {gain_db}");
+        }
+
+        /// Two positive boosts stack: a peaking filter never dips below 0 dB, so
+        /// at either band's centre the other still adds gain. The cascade peak
+        /// therefore clears the larger single band — the case the old
+        /// max-single-band check missed — yet never exceeds the two summed.
+        #[test]
+        fn peak_gain_sums_the_cascade_not_the_largest_band(
+            fc1 in 30.0f64..12_000.0,
+            fc2 in 30.0f64..12_000.0,
+            g1 in 0.5f64..15.0,
+            g2 in 0.5f64..15.0,
+            q1 in 0.5f64..4.0,
+            q2 in 0.5f64..4.0,
+        ) {
+            let both = Preset {
+                preamp_db: 0.0,
+                bands: vec![
+                    Band { kind: FilterKind::Peaking, fc_hz: fc1, gain_db: g1, q: q1 },
+                    Band { kind: FilterKind::Peaking, fc_hz: fc2, gain_db: g2, q: q2 },
+                ],
+            };
+            let peak_both = peak_gain_db(&both, 48_000.0).unwrap();
+            let peak1 = peak_gain_db(&one_band(FilterKind::Peaking, fc1, g1, q1), 48_000.0).unwrap();
+            let peak2 = peak_gain_db(&one_band(FilterKind::Peaking, fc2, g2, q2), 48_000.0).unwrap();
+            prop_assert!(peak_both > peak1.max(peak2));
+            prop_assert!(peak_both <= peak1 + peak2 + 1e-9);
+        }
     }
 
     #[test]
