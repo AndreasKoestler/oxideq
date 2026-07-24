@@ -62,13 +62,6 @@ impl BandFilter for DirectForm2Transposed<f64> {
 /// Internal monomorphized cascade: one concrete `F` per stage, so the
 /// per-sample loop inlines `F::run` with no vtable call. Public API is
 /// `EqChain`, which wraps one of these per backend.
-///
-/// The type must be `pub` (not `pub(crate)`) purely so it can appear as a
-/// variant field of the `pub enum EqChain` — Rust requires an enum's field
-/// types be at least as visible as the enum, and enum variant fields can't
-/// carry their own visibility modifier. Every constructor and method stays
-/// `pub(crate)`, so it remains unconstructible and uncallable from outside
-/// this crate: nameable, not usable.
 #[derive(Debug)]
 pub struct FilterCascade<F: Filter> {
     preamp: f64, // linear

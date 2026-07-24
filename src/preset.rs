@@ -315,8 +315,8 @@ Filter 1: ON PK Fc 105 Hz Gain -1.1 dB Q 0.70
         assert!(p.warnings.is_empty());
     }
 
-    /// Assert a parsed preset matches ground truth exactly (see the
-    /// exactness note in the plan: decimal → f64 is deterministic).
+    /// Assert a parsed preset matches ground truth exactly — decimal → f64
+    /// parsing is deterministic, so exact equality is valid.
     fn assert_preset(
         text: &str,
         preamp_db: f64,
@@ -358,8 +358,8 @@ Filter 1: ON PK Fc 105 Hz Gain -1.1 dB Q 0.70
         );
     }
 
-    // Edge cases pinning quirks of the original regex grammar, so the
-    // nom port stays behavior-compatible.
+    // Edge cases pinning grammar quirks (spacing, case, trailing garbage)
+    // so parser changes stay behavior-compatible.
 
     #[test]
     fn lowercase_keywords_accepted() {

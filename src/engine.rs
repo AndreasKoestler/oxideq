@@ -76,12 +76,9 @@ fn frame_aligned_chunk(cap: usize, channels: usize) -> usize {
     cap - cap % channels
 }
 
-/// Number of samples outside the normalized `[-1.0, 1.0]` range.
-///
-/// `.contains` is clippy-idiomatic and optimizes to the same code as
-/// `x < -1.0 || x > 1.0`; the `±1.0` boundary is in range. NaN fails the
-/// range test and therefore counts as clipped — intentional: a non-finite
-/// sample is faulty output worth warning about.
+/// Number of samples outside the normalized `[-1.0, 1.0]` range (the `±1.0`
+/// boundary is in range). NaN fails the range test and counts as clipped —
+/// intentional: a non-finite sample is faulty output worth warning about.
 #[must_use]
 fn count_clipped(samples: &[f32]) -> usize {
     samples
@@ -187,8 +184,8 @@ pub fn run(input: &Device, output: &Device, preset: &Preset, cfg: &EngineConfig)
 ///
 /// A single rate drives the whole pipeline: the ring has no resampler, so
 /// capture and playback must open at the same rate or the ring drifts and the
-/// audio pitch-shifts. Prints the same non-fatal warnings as before when the
-/// input default format is not f32 or the output cannot lock the requested rate.
+/// audio pitch-shifts. Prints non-fatal warnings when the input default
+/// format is not f32 or the output cannot lock the requested rate.
 ///
 /// # Errors
 /// Returns an error if either device config cannot be queried or no common
@@ -207,8 +204,6 @@ fn negotiated_stream_configs(
             in_default.sample_format()
         );
     }
-    // Detect the source rate at runtime. (cpal 0.18 `sample_rate()` returns
-    // a bare u32 — no `.0` to unwrap.)
     let want = in_default.sample_rate();
 
     let (rate, exact) = devices::negotiate_rate(input, output, want, cfg.channels)?;
