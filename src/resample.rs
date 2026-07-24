@@ -17,12 +17,9 @@ pub const MAX_FACTOR: usize = 16;
 fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0;
     let mut term = 1.0;
-    // Bounded: a non-finite `x` would make the convergence test
-    // `term < sum * 1e-18` never fire (comparisons against NaN are always
-    // false), so an unbounded loop could hang. The series converges in far
-    // fewer than 100 terms for the β ≤ ~13 used here, so real inputs still
-    // return at exactly the same term — the cap only turns a would-be hang
-    // on garbage input into a (garbage) return.
+    // Bounded: a non-finite `x` never satisfies the convergence test
+    // (NaN comparisons are false), so an unbounded loop could hang.
+    // Real inputs converge in far fewer than 100 terms.
     for k in 1..=100u32 {
         let f = x / (2.0 * f64::from(k));
         term *= f * f;
@@ -118,33 +115,12 @@ impl Upsampler2x {
         let n = self.buf.len();
         self.buf[self.pos] = x;
 
-        // Newest-first convolution over the ring: the tap index walks
-        // `pos → 0` then `n-1 → pos+1`. The obvious form — a `for &c in
-        // &self.branch` loop indexing `self.buf[idx]` with a manual wrap —
-        // costs more than it looks: the compiler cannot prove `idx < n`
-        // (idx seeds from the opaque `self.pos` field and is only kept in
-        // range by the wrap arithmetic), so it emits a `panic_bounds_check`
-        // on every tap. That check is not just a compare-and-branch; because
-        // it can panic mid-loop it is an optimization barrier that blocks the
-        // backend from unrolling and software-pipelining the otherwise
-        // independent multiplies (the halfband branch is ~48 taps at the
-        // first stage). asm confirmed the panic and the serial, un-unrolled
-        // loop; see `benches/dsp.rs` for the throughput win on the 4x/16x
-        // oversampled paths.
-        //
-        // Splitting the ring at `pos + 1` turns the walk into two contiguous
-        // forward slices consumed back-to-front. Slice iterators carry their
-        // own length, so no per-element bounds check is emitted and the loops
-        // unroll; the per-tap wrap test is gone too. The taps are still
-        // visited in the exact same order as the manual loop, so the f64
-        // accumulation order is unchanged and the output stays bit-identical
-        // (no fast-math reassociation involved — the exactness the resampler
-        // tests assert to 1e-15 is preserved).
-        //
-        // Bounds on the split: `pos < n` is maintained below, so
-        // `pos + 1 <= n` and `split_at` never panics; `branch.len() ==
-        // buf.len()`, so both slices split at the same point and stay
-        // tap-aligned.
+        // Newest-first ring convolution as two contiguous slices instead of
+        // an indexed walk with manual wrap: the compiler can't prove a
+        // wrapped index in range and emits a per-tap bounds check that
+        // blocks unrolling, while slice iterators carry their own length.
+        // Tap visitation order is unchanged, so the f64 accumulation order —
+        // and the output — stays bit-identical.
         let (buf_lo, buf_hi) = self.buf.split_at(self.pos + 1);
         let (br_lo, br_hi) = self.branch.split_at(self.pos + 1);
         let mut acc = 0.0;
@@ -207,16 +183,8 @@ impl Decimator2x {
         self.even[self.epos] = v0;
         self.odd[self.opos] = v1;
 
-        // Same newest-first ring convolution as `Upsampler2x::push`, over the
-        // even phase — see that method for why the two-contiguous-slice form
-        // is used: the manual `even[idx]` walk emits a per-tap
-        // `panic_bounds_check` the compiler can't elide, and that check is an
-        // optimization barrier that stops the multiply loop from unrolling.
-        // Slice iterators are provably in range, so the check and the wrap
-        // test both disappear and the loop unrolls; tap visitation order is
-        // unchanged, so the output stays bit-identical. `epos < ne` is
-        // maintained below and `branch.len() == even.len()`, so the split is
-        // in range and tap-aligned.
+        // Same two-slice ring convolution as `Upsampler2x::push` (bounds-check
+        // elision, identical accumulation order).
         let (ev_lo, ev_hi) = self.even.split_at(self.epos + 1);
         let (br_lo, br_hi) = self.branch.split_at(self.epos + 1);
         let mut acc = 0.0;
@@ -289,14 +257,11 @@ impl Oversampler {
     pub fn up(&mut self, x: f64, out: &mut [f64; MAX_FACTOR]) -> usize {
         out[0] = x;
         let mut n = 1;
-        // Disjoint-field borrow: `scratch` and `up` are separate fields, so
-        // both can be held mutably at once.
         let scratch = &mut self.scratch;
         for stage in &mut self.up {
-            // Copy the `n` live inputs, then expand forward: push() must see
-            // inputs in time order, and writing 2i/2i+1 straight into `out`
-            // would clobber not-yet-read inputs. Only the live prefix is
-            // copied, not the whole MAX_FACTOR array.
+            // push() must see inputs in time order, and writing 2i/2i+1
+            // straight into `out` would clobber not-yet-read inputs, so the
+            // live prefix is staged in `scratch` first.
             scratch[..n].copy_from_slice(&out[..n]);
             for (i, &s) in scratch[..n].iter().enumerate() {
                 let [a, b] = stage.push(s);
@@ -489,12 +454,9 @@ mod tests {
             })
             .collect();
         // -110 dBFS residual bound on a unit sine. Skip the first `d`
-        // outputs: the composite up+down FIR has support 2d+1 wide, so
-        // an output at t+d only draws exclusively on real (already-fed)
-        // input once t >= d; before that it still reaches into the
-        // zero-initialized pre-roll (t < 0), a causal-filter startup
-        // transient inherent to any implementation, not a resampler
-        // defect. Measured residual is already < 3e-6 by t ~ d/2.
+        // outputs: until t >= d they still draw on the zero-initialized
+        // pre-roll — a causal-filter startup transient, not a resampler
+        // defect.
         for t in d..input.len() - d {
             assert!(
                 (out[t + d] - input[t]).abs() < 3.2e-6,
@@ -548,15 +510,11 @@ mod tests {
                 (peak_t as f64 - lat).abs() <= 0.5,
                 "factor {factor}: peak at {peak_t}, latency {lat}"
             );
-            // For factor >= 4, `lat` is fractional: the true (continuous)
-            // impulse peak falls *between* two output samples, so the
-            // best any single sample can score is bounded by
-            // sinc(frac) = sin(pi*frac)/(pi*frac), frac = distance to the
-            // nearest integer sample — e.g. exactly half way (factor 4,
-            // frac=0.5) caps it at sin(0.5*pi)/(0.5*pi) ~= 0.637, not 1.0.
-            // Require getting within 10% of that theoretical ceiling
-            // rather than an unconditional 0.9 (only reachable when
-            // frac == 0, i.e. factor 2).
+            // Fractional `lat` (factor >= 4) puts the continuous impulse
+            // peak *between* output samples, so the best single sample is
+            // bounded by sinc(frac), frac = distance to the nearest sample
+            // (0.637 at frac 0.5) — hence 10% of that ceiling, not an
+            // unconditional 0.9.
             let frac = lat.fract().min(1.0 - lat.fract());
             let ideal_peak = if frac == 0.0 {
                 1.0

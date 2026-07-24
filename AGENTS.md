@@ -20,6 +20,11 @@
 - Use comments sparingly, only where they genuinely document critical context,
   invariants, business logic, or unavoidable architectural constraints.
 - Keep comments brief.
+- Litmus test before writing any comment: if the change it guards against
+  would fail to compile or fail a test with a clear message, the comment is
+  redundant — the toolchain documents it. Comment only what breaks silently
+  (performance contracts, real-time safety, numeric exactness, protocol
+  quirks).
 - Update comments during refactoring to avoid stale or wrong comments.
 - Use docstrings (`///`) for systematically generating public API documentation.
 - Use idiomatic doc headers: `# Safety`, `# Examples`, `# Errors`, and `# Panics`.
